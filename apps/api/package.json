@@ -1,0 +1,1 @@
+{"name":"@bolinha/api","private":true,"type":"module","scripts":{"dev":"tsx watch src/index.ts","build":"tsc -b"},"dependencies":{"@bolinha/core":"workspace:*","@bolinha/database":"workspace:*","@bolinha/exchange":"workspace:*","@bolinha/worker":"workspace:*","fastify":"^5.6.1"}}

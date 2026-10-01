@@ -1,0 +1,1 @@
+{"name":"@bolinha/ai","private":true,"type":"module","exports":"./src/index.ts","scripts":{"build":"tsc -b"},"dependencies":{"@bolinha/core":"workspace:*","@bolinha/market-data":"workspace:*","zod":"^4.1.12"}}

@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" }, { "path": "packages/market-data" }, { "path": "packages/ai" },
+    { "path": "packages/risk-engine" }, { "path": "packages/exchange" }, { "path": "packages/database" },
+    { "path": "apps/worker" }, { "path": "apps/api" }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "bolinha-trader",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "concurrently -n api,worker -c cyan,magenta \"pnpm --filter @bolinha/api dev\" \"pnpm --filter @bolinha/worker dev\"",
+    "build": "tsc -b",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "db:migrate": "tsx packages/database/src/migrate.ts",
+    "trading:once": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:once",
+    "trading:once:local": "pnpm --filter @bolinha/worker trading:once",
+    "trading:smoke:testnet": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:smoke:testnet",
+    "trading:force-close": "docker compose exec -T worker pnpm --filter @bolinha/worker force-close",
+    "trading:status": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:status",
+    "trading:day-test:check": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:day-test:check"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1", "@types/node": "^24.10.1", "concurrently": "^9.2.1",
+    "eslint": "^9.39.1", "eslint-config-prettier": "^10.1.8", "prettier": "^3.6.2",
+    "tsx": "^4.20.6", "typescript": "^5.9.3", "typescript-eslint": "^8.46.4", "vitest": "^4.0.8"
+  }
+}
