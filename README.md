@@ -37,10 +37,11 @@ curl -X POST http://127.0.0.1:3000/trading/run-once
 pnpm trading:force-close          # vende apenas a posição conceitual
 pnpm trading:status               # estado persistido da sessão atual
 pnpm trading:day-test:check       # resumo amigável para o teste diário
+pnpm trading:report:today         # relatório operacional diário persistido
 pnpm test && pnpm lint && pnpm typecheck && pnpm build
 ```
 
-Endpoints: `GET /health`, `/status`, `/positions`, `/trades`, `/decisions`, `/performance`, `/system/events`; e `POST /trading/run-once`. Não existe endpoint para enviar BUY/SELL arbitrário.
+Endpoints: `GET /health`, `/status`, `/positions`, `/trades`, `/decisions`, `/performance`, `/system/events`, `/reports/today` e `/reports/daily/:date`; e `POST /trading/run-once`. Não existe endpoint para enviar BUY/SELL arbitrário.
 
 O comando acima exige `docker compose up -d`; ele não expõe PostgreSQL no host. Para execução puramente local, com PostgreSQL local acessível, use `pnpm trading:once:local`.
 

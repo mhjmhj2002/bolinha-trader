@@ -11,4 +11,9 @@ describe('São Paulo daily session window', () => {
     ['17:55', '2026-10-01T20:55:00Z', 'FORCE_CLOSE'],
     ['18:00', '2026-10-01T21:00:00Z', 'FINISHED'],
   ])('%s maps to %s', (_label, iso, expected) => expect(phaseAt(iso)).toBe(expected));
+
+  it('keeps a post-close session in close-only mode when PostgreSQL reports an open position', () => {
+    expect(sessionPhase(new Date('2026-10-01T21:00:00Z'), undefined, true)).toBe('FORCE_CLOSE_PENDING');
+    expect(sessionPhase(new Date('2026-10-01T21:10:00Z'), undefined, true)).toBe('FORCE_CLOSE_PENDING');
+  });
 });

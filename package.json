@@ -16,7 +16,8 @@
     "trading:smoke:testnet": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:smoke:testnet",
     "trading:force-close": "docker compose exec -T worker pnpm --filter @bolinha/worker force-close",
     "trading:status": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:status",
-    "trading:day-test:check": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:day-test:check"
+    "trading:day-test:check": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:day-test:check",
+    "trading:report:today": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:report:today"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1", "@types/node": "^24.10.1", "concurrently": "^9.2.1",

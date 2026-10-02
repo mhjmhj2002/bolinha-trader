@@ -16,10 +16,51 @@ describe('one trading cycle', () => {
   it('force close is idempotent and sells only the persisted conceptual position', async () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .001, entryPrice: 10_000, costUsdt: 10, openedAt: new Date() };
     let submitted = 0;
-    const repo = { ensureAccount: async () => {}, event: async () => {}, openPosition: async () => position, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => { position = null; } };
-    const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async () => { submitted++; return { orderId: 'one', side: 'SELL' as const, executedQty: .001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
+    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, openPosition: async () => position, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => { position = null; } };
+    const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async () => { submitted++; return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: .001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
     const service = new TradingService(repo as never, exchange as never, {} as never);
-    await service.forceClosePosition(); await service.forceClosePosition();
+    await service.runOnce(new Date('2026-10-01T20:59:00Z'));
+    await service.runOnce(new Date('2026-10-01T20:59:00Z'));
     expect(submitted).toBe(1);
+  });
+
+  it('a normal AI SELL ignores a partial amount and persists exactly the quantity sent to Binance', async () => {
+    let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .0015, entryPrice: 10_000, costUsdt: 15, openedAt: new Date() };
+    const sent: number[] = [];
+    const recorded: number[] = [];
+    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 5, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => false, saveSnapshot: async () => 1, saveDecision: async () => 1, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async (order: { quantity: number }) => { recorded.push(order.quantity); position = null; } };
+    const exchange = { candles: async () => candles.map((c) => ({ ...c, open: 10_000, high: 10_001, low: 9_999, close: 10_000 })), rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), placeMarketOrder: async (_side: string, quantity: number) => { sent.push(quantity); return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: quantity, cummulativeQuoteQty: quantity * 10_000, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
+    const ai = { decide: async () => ({ decision: { action: 'SELL' as const, amountUsdt: 1, confidence: 1, reason: 'sell only one USDT', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T12:00:00Z'));
+    expect(result.action).toBe('SELL');
+    expect(sent).toEqual([.0015]);
+    expect(recorded).toEqual(sent);
+    expect(position).toBeNull();
+  });
+
+  it('retries the same pending SELL after 17:55 and only closes after Binance confirms it', async () => {
+    let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .001, entryPrice: 10_000, costUsdt: 10, openedAt: new Date() };
+    let pending: { id: number; clientOrderId: string; side: 'SELL'; requestedAmount: number; requestedQuantity: number } | null = null;
+    const clientIds: string[] = [];
+    let attempts = 0;
+    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => Boolean(pending), pendingOrderDetails: async () => pending, createPendingOrder: async (clientOrderId: string, side: 'SELL', amount: number, quantity: number) => { pending = { id: 1, clientOrderId, side, requestedAmount: amount, requestedQuantity: quantity }; return 1; }, markOrderRejected: async () => {}, recordExecution: async () => { position = null; pending = null; } };
+    const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async (_side: string, quantity: number, clientOrderId: string) => { clientIds.push(clientOrderId); attempts++; if (attempts === 1) throw new Error('temporary Binance outage'); return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: quantity, cummulativeQuoteQty: quantity * 10_000, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
+    const service = new TradingService(repo as never, exchange as never, {} as never);
+    await expect(service.runOnce(new Date('2026-10-01T20:59:00Z'))).rejects.toThrow('temporary Binance outage');
+    expect(position).not.toBeNull();
+    await service.runOnce(new Date('2026-10-01T21:03:00Z'));
+    expect(position).toBeNull();
+    expect(clientIds).toHaveLength(2);
+    expect(new Set(clientIds).size).toBe(1);
+  });
+
+  it('at 18:10 after restart, an open position is still closed instead of being treated as FINISHED', async () => {
+    let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .001, entryPrice: 10_000, costUsdt: 10, openedAt: new Date() };
+    let submitted = 0;
+    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => { position = null; } };
+    const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async () => { submitted++; return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: .001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
+    await new TradingService(repo as never, exchange as never, {} as never).runOnce(new Date('2026-10-01T21:10:00Z'));
+    expect(submitted).toBe(1);
+    expect(position).toBeNull();
   });
 });

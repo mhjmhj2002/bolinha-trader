@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Operação Bolinha de Gude</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="/dashboard/dashboard.css" rel="stylesheet">
+  </head>
+  <body class="bg-body-tertiary">
+    <main class="container-fluid dashboard-shell py-3 py-lg-4">
+      <header class="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-4">
+        <div>
+          <div class="eyebrow">PAINEL OPERACIONAL</div>
+          <h1 class="h3 mb-1">Operação Bolinha de Gude</h1>
+          <div class="text-secondary small" id="session-date">Carregando sessão…</div>
+        </div>
+        <div class="d-flex align-items-center gap-2 flex-wrap justify-content-end">
+          <span id="connection" class="small text-secondary">Conectando…</span>
+          <span id="overall-status" class="badge text-bg-secondary px-3 py-2">—</span>
+          <button id="today-button" class="btn btn-outline-secondary btn-sm">Hoje</button>
+          <input id="date-filter" class="form-control form-control-sm" type="date" aria-label="Data da sessão">
+        </div>
+      </header>
+
+      <section class="status-strip card border-0 shadow-sm mb-4">
+        <div class="card-body py-3">
+          <div class="row g-3 small" id="health-grid"></div>
+        </div>
+      </section>
+
+      <section class="row g-3 mb-4" id="metric-cards">
+        <div class="col-6 col-lg-2"><article class="card metric-card h-100"><div class="card-body"><div class="metric-label">BANCA ATUAL</div><div class="metric-value" id="metric-bank">—</div><small id="metric-initial" class="text-secondary">Inicial: —</small></div></article></div>
+        <div class="col-6 col-lg-2"><article class="card metric-card h-100"><div class="card-body"><div class="metric-label">RESULTADO DO DIA</div><div class="metric-value" id="metric-pnl">—</div><small id="metric-return" class="text-secondary">—</small></div></article></div>
+        <div class="col-6 col-lg-2"><article class="card metric-card h-100"><div class="card-body"><div class="metric-label">POSIÇÃO</div><div class="metric-value compact" id="metric-position">—</div><small id="metric-position-detail" class="text-secondary">—</small></div></article></div>
+        <div class="col-6 col-lg-2"><article class="card metric-card h-100"><div class="card-body"><div class="metric-label">TRADES</div><div class="metric-value" id="metric-trades">—</div><small class="text-secondary">no dia</small></div></article></div>
+        <div class="col-6 col-lg-2"><article class="card metric-card h-100"><div class="card-body"><div class="metric-label">CUSTO IA</div><div class="metric-value" id="metric-ai-cost">—</div><small id="metric-tokens" class="text-secondary">— tokens</small></div></article></div>
+        <div class="col-6 col-lg-2"><article class="card metric-card h-100"><div class="card-body"><div class="metric-label">ERROS</div><div class="metric-value" id="metric-errors">—</div><small id="metric-fallbacks" class="text-secondary">— fallbacks</small></div></article></div>
+      </section>
+
+      <section class="row g-3 mb-4">
+        <div class="col-12 col-xl-8"><article class="card h-100 shadow-sm border-0"><div class="card-body"><h2 class="h6">Evolução da banca</h2><div class="chart-wrap"><canvas id="equity-chart"></canvas></div></div></article></div>
+        <div class="col-12 col-xl-4"><article class="card h-100 shadow-sm border-0"><div class="card-body"><h2 class="h6">Decisões da IA</h2><div class="chart-wrap"><canvas id="decisions-chart"></canvas></div><div id="rejected-decisions" class="small text-secondary text-center mt-2"></div></div></article></div>
+        <div class="col-12 col-xl-8"><article class="card h-100 shadow-sm border-0"><div class="card-body"><h2 class="h6">P/L acumulado</h2><div class="chart-wrap"><canvas id="pnl-chart"></canvas></div></div></article></div>
+        <div class="col-12 col-xl-4"><article class="card h-100 shadow-sm border-0"><div class="card-body"><h2 class="h6">Modelos de IA</h2><div class="chart-wrap"><canvas id="models-chart"></canvas></div></div></article></div>
+      </section>
+
+      <section class="row g-3 mb-4">
+        <div class="col-12 col-xl-8"><article class="card shadow-sm border-0"><div class="card-body"><h2 class="h6">Trades</h2><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Horário</th><th>Lado</th><th>BTC</th><th>Preço médio</th><th>USDT</th><th>Taxa</th><th>P/L</th><th>Ordem Binance</th></tr></thead><tbody id="trades-table"></tbody></table></div></div></article></div>
+        <div class="col-12 col-xl-4"><article class="card shadow-sm border-0 h-100"><div class="card-body"><h2 class="h6">Sessão do dia</h2><ol class="session-timeline" id="session-timeline"></ol><div id="final-summary" class="border-top pt-3 mt-3 small"></div></div></article></div>
+      </section>
+
+      <section class="row g-3 mb-4">
+        <div class="col-12"><article class="card shadow-sm border-0"><div class="card-body"><h2 class="h6">Decisões recentes</h2><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Horário</th><th>Modelo</th><th>IA</th><th>Após risco</th><th>Valor</th><th>Confiança</th><th>Motivo</th><th>Rejeição</th></tr></thead><tbody id="decisions-table"></tbody></table></div></div></article></div>
+        <div class="col-12"><article class="card shadow-sm border-0"><div class="card-body"><div class="d-flex justify-content-between align-items-center"><h2 class="h6 mb-0">Eventos</h2><label class="form-check form-switch small mb-0"><input id="show-info" class="form-check-input" type="checkbox"> Mostrar INFO</label></div><div class="table-responsive mt-3"><table class="table table-sm align-middle mb-0"><thead><tr><th>Horário</th><th>Nível</th><th>Evento</th><th>Mensagem</th></tr></thead><tbody id="events-table"></tbody></table></div></div></article></div>
+      </section>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+    <script src="/dashboard/dashboard.js"></script>
+  </body>
+</html>

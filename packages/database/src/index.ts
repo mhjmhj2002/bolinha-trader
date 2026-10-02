@@ -1,12 +1,27 @@
 import pg from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { config, sessionDay, type Account, type Position, type SessionPhase } from '@bolinha/core';
+import { buildDailyReport, config, isSessionDay, sessionDay, sessionSchedule, type Account, type DailyReport, type DailyReportInput, type Position, type SessionPhase } from '@bolinha/core';
 import type { AiDecision, AiUsage } from '@bolinha/ai';
 import type { MarketSnapshot } from '@bolinha/market-data';
+import { executionAccounting, type ExecutionFill } from './accounting.js';
+export { executionAccounting, summarizeFees, type ExecutionFill } from './accounting.js';
 export const pool = new pg.Pool({ connectionString: config.DATABASE_URL, max: 5 });
 export const db = drizzle(pool); // Drizzle is the ORM boundary; explicit SQL below keeps ledger transactions auditable.
 type Row = Record<string, unknown>;
 const num = (value: unknown) => Number(value);
+export type PendingOrder = {
+  id: number;
+  clientOrderId: string;
+  side: 'BUY' | 'SELL';
+  requestedAmount: number;
+  requestedQuantity: number | null;
+};
+export type ReconciliationState = {
+  status: 'OK' | 'RUNNING' | 'ERROR';
+  stateConsistent: boolean;
+  lastReconciliationAt: Date | null;
+  lastError: string | null;
+};
 export class TradingRepository {
   constructor(private client: pg.Pool = pool) {}
   async health() {
@@ -49,6 +64,56 @@ export class TradingRepository {
     const { rows } = await this.client.query("select 1 from orders where status='PENDING' limit 1");
     return rows.length > 0;
   }
+  async pendingOrderCount(): Promise<number> {
+    return Number((await this.client.query("select count(*) from orders where status='PENDING'")).rows[0].count);
+  }
+  async pendingOrders(): Promise<PendingOrder[]> {
+    const { rows } = await this.client.query<Row>(
+      "select * from orders where status='PENDING' order by id",
+    );
+    return rows.map((r) => ({
+      id: num(r.id),
+      clientOrderId: String(r.client_order_id),
+      side: String(r.side) as 'BUY' | 'SELL',
+      requestedAmount: num(r.requested_amount),
+      requestedQuantity: r.requested_quantity === null ? null : num(r.requested_quantity),
+    }));
+  }
+  async pendingOrderDetails(): Promise<PendingOrder | null> {
+    return (await this.pendingOrders())[0] ?? null;
+  }
+  async reconciliationState(): Promise<ReconciliationState> {
+    const { rows } = await this.client.query<Row>('select * from reconciliation_state where id=true');
+    if (!rows[0]) return { status: 'ERROR', stateConsistent: false, lastReconciliationAt: null, lastError: 'Startup reconciliation has not run' };
+    const r = rows[0];
+    return {
+      status: String(r.status) as ReconciliationState['status'],
+      stateConsistent: Boolean(r.state_consistent),
+      lastReconciliationAt: r.last_reconciled_at ? new Date(String(r.last_reconciled_at)) : null,
+      lastError: r.last_error === null ? null : String(r.last_error),
+    };
+  }
+  async reconciliationStarted() {
+    await this.client.query("insert into reconciliation_state(id,status,state_consistent,last_error,updated_at) values(true,'RUNNING',false,null,now()) on conflict(id) do update set status='RUNNING',state_consistent=false,last_error=null,updated_at=now()");
+  }
+  async reconciliationCompleted() {
+    await this.client.query("insert into reconciliation_state(id,status,state_consistent,last_reconciled_at,last_error,updated_at) values(true,'OK',true,now(),null,now()) on conflict(id) do update set status='OK',state_consistent=true,last_reconciled_at=now(),last_error=null,updated_at=now()");
+  }
+  async reconciliationFailed(error: string) {
+    await this.client.query("insert into reconciliation_state(id,status,state_consistent,last_error,updated_at) values(true,'ERROR',false,$1,now()) on conflict(id) do update set status='ERROR',state_consistent=false,last_error=excluded.last_error,updated_at=now()", [error]);
+  }
+  async stateConsistency(): Promise<{ consistent: boolean; reason: string | null }> {
+    const { rows } = await this.client.query<{ pending: string; execution_without_trade: string }>(
+      `select
+        (select count(*) from orders where status='PENDING') as pending,
+        (select count(*) from orders o left join trades t on t.order_id=o.id where o.status='FILLED' and t.id is null) as execution_without_trade`,
+    );
+    const pending = Number(rows[0].pending);
+    const missingTrades = Number(rows[0].execution_without_trade);
+    if (pending) return { consistent: false, reason: `${pending} pending order(s) remain` };
+    if (missingTrades) return { consistent: false, reason: `${missingTrades} filled order(s) have no ledger trade` };
+    return { consistent: true, reason: null };
+  }
   async heartbeat(id = 'worker') {
     await this.client.query('insert into worker_heartbeats(worker_id,status) values($1,$2)', [id, 'UP']);
   }
@@ -69,8 +134,8 @@ export class TradingRepository {
     const existing = await this.client.query<Row>('select phase from trading_sessions where session_day=$1', [day]);
     const previous = existing.rows[0]?.phase as SessionPhase | undefined;
     await this.client.query(
-      `insert into trading_sessions(session_day,timezone,phase,started_at,finished_at,next_cycle_at,updated_at)
-       values($1,$2,$3,case when $3='TRADING' then $4 else null end,case when $3='FINISHED' then $4 else null end,$5,$4)
+      `insert into trading_sessions(session_day,timezone,phase,started_at,finished_at,next_cycle_at,initial_equity_usdt,updated_at)
+       values($1,$2,$3,case when $3='TRADING' then $4 else null end,case when $3='FINISHED' then $4 else null end,$5,(select cash_usdt from trading_account order by id limit 1),$4)
        on conflict(session_day) do update set phase=excluded.phase, next_cycle_at=excluded.next_cycle_at,
          started_at=coalesce(trading_sessions.started_at, case when excluded.phase='TRADING' then excluded.updated_at else null end),
          finished_at=case when excluded.phase='FINISHED' then coalesce(trading_sessions.finished_at,excluded.updated_at) else trading_sessions.finished_at end,
@@ -99,6 +164,16 @@ export class TradingRepository {
       [snapshot.symbol, snapshot],
     );
     return rows[0].id;
+  }
+  /** A compact financial point for the operational dashboard, persisted once per worker cycle. */
+  async saveAccountSnapshot(price: number, at = new Date()) {
+    const [performance, position] = await Promise.all([this.performance(price), this.openPosition()]);
+    await this.client.query(
+      `insert into account_snapshots(cash_usdt,equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,net_pnl_usdt,price,position_quantity,position_cost_usdt,created_at)
+       values($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [performance.cashUsdt, performance.equityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt,
+        performance.netPnlUsdt, price, position?.quantity ?? null, position?.costUsdt ?? null, at],
+    );
   }
   async saveDecision(
     decision: AiDecision,
@@ -143,15 +218,15 @@ export class TradingRepository {
       ]);
     return rows[0].id;
   }
-  async createPendingOrder(clientOrderId: string, side: string, amount: number): Promise<number> {
+  async createPendingOrder(clientOrderId: string, side: string, amount: number, quantity: number): Promise<number> {
     const { rows } = await this.client.query<{ id: number }>(
-      'insert into orders(client_order_id,side,requested_amount,status) values($1,$2,$3,$4) returning id',
-      [clientOrderId, side, amount, 'PENDING'],
+      'insert into orders(client_order_id,side,requested_amount,requested_quantity,status) values($1,$2,$3,$4,$5) returning id',
+      [clientOrderId, side, amount, quantity, 'PENDING'],
     );
     return rows[0].id;
   }
-  async markOrderRejected(id: number) {
-    await this.client.query("update orders set status='REJECTED' where id=$1 and status='PENDING'", [id]);
+  async markOrderRejected(id: number, reason = 'Rejected during reconciliation') {
+    await this.client.query("update orders set status='REJECTED',reconciliation_reason=$2 where id=$1 and status='PENDING'", [id, reason]);
   }
   async recordExecution(order: {
     id: number;
@@ -160,53 +235,115 @@ export class TradingRepository {
     quantity: number;
     quote: number;
     commission: number;
+    fills?: ExecutionFill[];
     at: Date;
-  }): Promise<void> {
+  }): Promise<{ applied: boolean }> {
     const c = await this.client.connect();
     try {
       await c.query('begin');
+      // The local order id is tied to the unique clientOrderId; the alternate
+      // lookup makes a replay with a known Binance id idempotent too.
+      const persisted = await c.query<Row>(
+        'select * from orders where id=$1 or binance_order_id=$2 order by id=$1 desc for update',
+        [order.id, order.binanceOrderId],
+      );
+      if (!persisted.rows[0]) throw new Error('Cannot record execution for an absent order');
+      const pending = persisted.rows[0];
+      if (String(pending.status) === 'FILLED') {
+        if (String(pending.binance_order_id) !== order.binanceOrderId || String(pending.side) !== order.side)
+          throw new Error('Execution identity conflicts with an already filled order');
+        await c.query('commit');
+        return { applied: false };
+      }
+      if (String(pending.status) !== 'PENDING') throw new Error('Cannot record execution for a non-pending order');
+      if (String(pending.side) !== order.side) throw new Error('Execution side does not match pending order');
+      const fills = order.fills ?? [];
+      const accounting = executionAccounting(order.side as 'BUY' | 'SELL', order.quantity, order.quote, fills);
+      if (accounting.positionQuantity <= 0)
+        throw new Error('Execution leaves no positive BTC quantity after base-asset fees');
+      const requestedQuantity = pending.requested_quantity === null ? null : num(pending.requested_quantity);
+      const fulfilledQuantity = order.side === 'SELL' ? accounting.positionQuantity : order.quantity;
+      if (requestedQuantity !== null && Math.abs(requestedQuantity - fulfilledQuantity) > 1e-12)
+        throw new Error('Execution quantity does not match the pending order quantity after base-asset fees');
       await c.query(
         "update orders set binance_order_id=$1,executed_quantity=$2,executed_quote_amount=$3,commission=$4,status='FILLED',executed_at=$5 where id=$6",
-        [order.binanceOrderId, order.quantity, order.quote, order.commission, order.at, order.id],
+        [order.binanceOrderId, order.quantity, order.quote, accounting.quoteFee, order.at, order.id],
       );
+      const persistedFills: Array<{ id: number; fill: ExecutionFill }> = [];
+      for (const fill of fills) {
+        const inserted = await c.query<{ id: number }>(
+          `insert into order_fills(order_id,trade_id,price,quantity,commission,commission_asset,raw)
+           values($1,$2,$3,$4,$5,$6,$7) returning id`,
+          [order.id, fill.tradeId ?? null, fill.price, fill.qty, fill.commission, fill.commissionAsset, fill],
+        );
+        persistedFills.push({ id: inserted.rows[0].id, fill });
+      }
       if (order.side === 'BUY') {
         const p = await c.query<{ id: number }>(
           'insert into positions(symbol,quantity,entry_price,cost_usdt,status,opened_at) values($1,$2,$3,$4,$5,$6) returning id',
-          ['BTCUSDT', order.quantity, order.quote / order.quantity, order.quote, 'OPEN', order.at],
+          ['BTCUSDT', accounting.positionQuantity, accounting.effectiveQuoteAmount / accounting.positionQuantity, accounting.effectiveQuoteAmount, 'OPEN', order.at],
         );
-        await c.query(
-          'insert into trades(order_id,position_id,side,quantity,quote_amount,commission,executed_at) values($1,$2,$3,$4,$5,$6,$7)',
-          [order.id, p.rows[0].id, 'BUY', order.quantity, order.quote, order.commission, order.at],
+        const trade = await c.query<{ id: number }>(
+          `insert into trades(order_id,position_id,side,quantity,quote_amount,net_quantity,net_quote_amount,fees_usdt_known,commission,executed_at)
+           values($1,$2,$3,$4,$5,$6,$7,$8,$8,$9) returning id`,
+          [order.id, p.rows[0].id, 'BUY', order.quantity, order.quote, accounting.positionQuantity, accounting.effectiveQuoteAmount, accounting.quoteFee, order.at],
         );
-        await c.query('update trading_account set cash_usdt=cash_usdt-$1,updated_at=now()', [order.quote]);
+        await this.recordTradeFees(c, trade.rows[0].id, persistedFills);
+        await c.query('update trading_account set cash_usdt=cash_usdt-$1,updated_at=now()', [accounting.effectiveQuoteAmount]);
       } else {
         const pos = await c.query<Row>(
           "select * from positions where status='OPEN' order by id desc limit 1 for update",
         );
         if (!pos.rows[0]) throw new Error('Cannot close absent position');
         const p = pos.rows[0];
+        const positionQuantity = num(p.quantity);
+        if (Math.abs(positionQuantity - accounting.positionQuantity) > 1e-12)
+          throw new Error('Refusing to close a position after a partial SELL execution or an unaccounted base-asset fee');
         const cost = num(p.cost_usdt);
-        const pnl = order.quote - cost - order.commission;
+        const opening = await c.query<Row>(
+          "select quote_amount from trades where position_id=$1 and side='BUY' order by id limit 1",
+          [p.id],
+        );
+        if (!opening.rows[0]) throw new Error('Cannot calculate P/L without the opening BUY trade');
+        const grossPnl = order.quote - num(opening.rows[0].quote_amount);
+        const pnl = accounting.effectiveQuoteAmount - cost;
         await c.query("update positions set status='CLOSED',closed_at=$1,realized_pnl_usdt=$2 where id=$3", [
           order.at,
           pnl,
           p.id,
         ]);
-        await c.query(
-          'insert into trades(order_id,position_id,side,quantity,quote_amount,commission,executed_at) values($1,$2,$3,$4,$5,$6,$7)',
-          [order.id, p.id, 'SELL', order.quantity, order.quote, order.commission, order.at],
+        const trade = await c.query<{ id: number }>(
+          `insert into trades(order_id,position_id,side,quantity,quote_amount,net_quantity,net_quote_amount,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,commission,executed_at)
+           values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$11) returning id`,
+          [order.id, p.id, 'SELL', order.quantity, order.quote, accounting.positionQuantity, accounting.effectiveQuoteAmount, grossPnl, accounting.quoteFee, pnl, order.at],
         );
+        await this.recordTradeFees(c, trade.rows[0].id, persistedFills);
         await c.query(
           'update trading_account set cash_usdt=cash_usdt+$1,realized_pnl_usdt=realized_pnl_usdt+$2,updated_at=now()',
-          [order.quote, pnl],
+          [accounting.effectiveQuoteAmount, pnl],
         );
       }
       await c.query('commit');
+      return { applied: true };
     } catch (error) {
       await c.query('rollback');
       throw error;
     } finally {
       c.release();
+    }
+  }
+  private async recordTradeFees(
+    c: pg.PoolClient,
+    tradeId: number,
+    fills: Array<{ id: number; fill: ExecutionFill }>,
+  ) {
+    for (const { id, fill } of fills) {
+      if (fill.commission === 0) continue;
+      const asset = fill.commissionAsset.toUpperCase();
+      await c.query(
+        'insert into trade_fees(trade_id,fill_id,asset,amount,amount_usdt) values($1,$2,$3,$4,$5)',
+        [tradeId, id, asset, fill.commission, asset === 'USDT' ? fill.commission : null],
+      );
     }
   }
   async positions() {
@@ -216,7 +353,14 @@ export class TradingRepository {
     return (await this.client.query('select * from orders order by id desc')).rows;
   }
   async trades() {
-    return (await this.client.query('select * from trades order by id desc')).rows;
+    return (await this.client.query(
+      `select t.*, coalesce(f.fees,'[]'::jsonb) as fees, coalesce(f.fees_by_asset,'{}'::jsonb) as fees_by_asset
+       from trades t left join lateral (
+         select jsonb_agg(jsonb_build_object('asset',asset,'amount',amount,'amountUsdt',amount_usdt) order by id) as fees,
+                jsonb_object_agg(asset,amount) as fees_by_asset
+         from trade_fees where trade_id=t.id
+       ) f on true order by t.id desc`,
+    )).rows;
   }
   async decisions() {
     return (await this.client.query('select * from ai_decisions order by id desc limit 100')).rows;
@@ -239,6 +383,11 @@ export class TradingRepository {
   async createDailyResult(price: number, at = new Date()) {
     const day = sessionDay(at);
     const performance = await this.performance(price);
+    const session = await this.session(at);
+    const initialEquityUsdt = session?.initial_equity_usdt === null || session?.initial_equity_usdt === undefined
+      ? performance.initialBankUsdt
+      : num(session.initial_equity_usdt);
+    const dailyFees = await this.feeSummary(day);
     const { rows } = await this.client.query<Row>(
       `select
        count(*) filter (where t.side='BUY')::int as buy_count, count(*) filter (where t.side='SELL')::int as sell_count,
@@ -251,29 +400,267 @@ export class TradingRepository {
        (select count(*)::int from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='ai_fallback') as fallback_count,
        (select count(*)::int from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.level='ERROR') as error_count,
        (select exists(select 1 from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='force_close_started')) as forced_close,
-       (select min(created_at) from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='trading_session_started') as started_at
+       (select min(created_at) from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='trading_session_started') as started_at,
+       coalesce(sum(t.gross_pnl_usdt) filter (where t.side='SELL'),0) as gross_pnl,
+       coalesce(sum(t.net_pnl_usdt) filter (where t.side='SELL'),0) as net_pnl
        from trades t where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1`,
       [day, config.TRADING_TIMEZONE],
     );
     const metrics = rows[0];
     await this.client.query(
-      `insert into daily_results(day,session_day,timezone,equity_usdt,initial_equity_usdt,final_equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,gross_return_pct,trade_count,buy_count,sell_count,hold_count,rejected_decision_count,ai_call_count,ai_cost_usd,models_used,fallback_count,error_count,forced_close_occurred,started_at,finished_at)
-       values($1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-       on conflict(session_day) where session_day is not null do update set final_equity_usdt=excluded.final_equity_usdt,equity_usdt=excluded.equity_usdt,realized_pnl_usdt=excluded.realized_pnl_usdt,unrealized_pnl_usdt=excluded.unrealized_pnl_usdt,gross_return_pct=excluded.gross_return_pct,trade_count=excluded.trade_count,buy_count=excluded.buy_count,sell_count=excluded.sell_count,hold_count=excluded.hold_count,rejected_decision_count=excluded.rejected_decision_count,ai_call_count=excluded.ai_call_count,ai_cost_usd=excluded.ai_cost_usd,models_used=excluded.models_used,fallback_count=excluded.fallback_count,error_count=excluded.error_count,forced_close_occurred=excluded.forced_close_occurred,finished_at=excluded.finished_at`,
-      [at, day, config.TRADING_TIMEZONE, performance.equityUsdt, performance.initialBankUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, ((performance.equityUsdt-performance.initialBankUsdt)/performance.initialBankUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, metrics.models, metrics.fallback_count, metrics.error_count, metrics.forced_close, metrics.started_at, at],
+      `insert into daily_results(day,session_day,timezone,equity_usdt,initial_equity_usdt,final_equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,fees_by_asset,gross_return_pct,trade_count,buy_count,sell_count,hold_count,rejected_decision_count,ai_call_count,ai_cost_usd,models_used,fallback_count,error_count,forced_close_occurred,started_at,finished_at)
+       values($1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+       on conflict(session_day) where session_day is not null do update set final_equity_usdt=excluded.final_equity_usdt,equity_usdt=excluded.equity_usdt,realized_pnl_usdt=excluded.realized_pnl_usdt,unrealized_pnl_usdt=excluded.unrealized_pnl_usdt,gross_pnl_usdt=excluded.gross_pnl_usdt,fees_usdt_known=excluded.fees_usdt_known,net_pnl_usdt=excluded.net_pnl_usdt,fees_by_asset=excluded.fees_by_asset,gross_return_pct=excluded.gross_return_pct,trade_count=excluded.trade_count,buy_count=excluded.buy_count,sell_count=excluded.sell_count,hold_count=excluded.hold_count,rejected_decision_count=excluded.rejected_decision_count,ai_call_count=excluded.ai_call_count,ai_cost_usd=excluded.ai_cost_usd,models_used=excluded.models_used,fallback_count=excluded.fallback_count,error_count=excluded.error_count,forced_close_occurred=excluded.forced_close_occurred,finished_at=excluded.finished_at`,
+      [at, day, config.TRADING_TIMEZONE, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, num(metrics.gross_pnl), dailyFees.feesUsdtKnown, num(metrics.net_pnl), dailyFees.feesByAsset, ((performance.equityUsdt-initialEquityUsdt)/initialEquityUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, metrics.models, metrics.fallback_count, metrics.error_count, metrics.forced_close, metrics.started_at, at],
     );
     return this.dailyResult(day);
+  }
+  private async feeSummary(day?: string) {
+    const daily = day
+      ? await this.client.query<Row>(
+        `select tf.asset, coalesce(sum(tf.amount),0) as amount, coalesce(sum(tf.amount_usdt),0) as amount_usdt
+         from trade_fees tf join trades t on t.id=tf.trade_id
+         where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1 group by tf.asset`,
+        [day, config.TRADING_TIMEZONE],
+      )
+      : await this.client.query<Row>('select asset, coalesce(sum(amount),0) as amount, coalesce(sum(amount_usdt),0) as amount_usdt from trade_fees group by asset');
+    const feesByAsset: Record<string, number> = {};
+    let feesUsdtKnown = 0;
+    for (const row of daily.rows) {
+      const asset = String(row.asset);
+      feesByAsset[asset] = num(row.amount);
+      feesUsdtKnown += num(row.amount_usdt);
+    }
+    return { feesByAsset, feesUsdtKnown };
+  }
+  /**
+   * Reads all report evidence from PostgreSQL.  No exchange call is made here:
+   * a completed day is represented by its final daily_result ledger snapshot.
+   */
+  async dailyReport(day = sessionDay()): Promise<DailyReport> {
+    if (!isSessionDay(day)) throw new Error('date must use the YYYY-MM-DD calendar format');
+    const schedule = sessionSchedule();
+    const localDay = [day, config.TRADING_TIMEZONE];
+    const [sessionResult, dailyResult, accountResult, operationResult, aiResult, modelResult, eventResult, pendingResult, rejectedResult, positionResult] = await Promise.all([
+      this.client.query<Row>('select * from trading_sessions where session_day=$1', [day]),
+      this.client.query<Row>('select * from daily_results where session_day=$1', [day]),
+      this.client.query<Row>('select * from trading_account order by id limit 1'),
+      this.client.query<Row>(
+        `select
+           count(*) filter (where side='BUY')::int as buy_count,
+           count(*) filter (where side='SELL')::int as sell_count,
+           coalesce(sum(net_pnl_usdt) filter (where side='SELL'),0) as net_pnl,
+           (select count(*)::int from ai_decisions where to_char(timestamp at time zone $2,'YYYY-MM-DD')=$1 and action_after_risk='HOLD') as hold_count,
+           (select count(*)::int from ai_decisions where to_char(timestamp at time zone $2,'YYYY-MM-DD')=$1 and rejection_reason is not null) as rejected_count
+         from trades where to_char(executed_at at time zone $2,'YYYY-MM-DD')=$1`,
+        localDay,
+      ),
+      this.client.query<Row>(
+        `select count(*)::int as calls, coalesce(sum(cost_usd),0) as cost_usd
+         from ai_usage where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1`,
+        localDay,
+      ),
+      this.client.query<Row>(
+        `select model, count(*)::int as calls from ai_usage
+         where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1
+         group by model order by model`,
+        localDay,
+      ),
+      this.client.query<Row>(
+        `select level,event,message,payload,created_at from system_events
+         where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at`,
+        localDay,
+      ),
+      this.client.query<Row>(
+        `select count(*)::int as count from orders
+         where status='PENDING' and to_char(created_at at time zone $2,'YYYY-MM-DD')=$1`,
+        localDay,
+      ),
+      this.client.query<Row>(
+        `select count(*)::int as count from orders
+         where status='REJECTED' and to_char(created_at at time zone $2,'YYYY-MM-DD')=$1`,
+        localDay,
+      ),
+      this.client.query<Row>(
+        `select exists(
+           select 1 from positions
+           where opened_at <= (($1::date + $2::time) at time zone $3)
+             and (closed_at is null or closed_at > (($1::date + $2::time) at time zone $3))
+         ) as open_after_end`,
+        [day, schedule.end, config.TRADING_TIMEZONE],
+      ),
+    ]);
+    const sessionRow = sessionResult.rows[0];
+    const dailyRow = dailyResult.rows[0];
+    const accountRow = accountResult.rows[0];
+    const operations = operationResult.rows[0];
+    const usage = aiResult.rows[0];
+    const events = eventResult.rows;
+    const eventCount = (event: string) => events.filter((row) => String(row.event) === event).length;
+    const payloadService = (row: Row) => {
+      const payload = row.payload;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return '';
+      const service = (payload as Record<string, unknown>).service;
+      return typeof service === 'string' ? service.toLowerCase() : '';
+    };
+    const cycleTimes = events
+      .filter((row) => String(row.event) === 'cycle_started')
+      .map((row) => new Date(String(row.created_at)).getTime())
+      .filter(Number.isFinite);
+    let maxCycleGapSeconds: number | null = null;
+    for (let index = 1; index < cycleTimes.length; index++) {
+      const seconds = (cycleTimes[index] - cycleTimes[index - 1]) / 1000;
+      maxCycleGapSeconds = Math.max(maxCycleGapSeconds ?? 0, seconds);
+    }
+    const models = Object.fromEntries(modelResult.rows.map((row) => [String(row.model), num(row.calls)]));
+    const startMinutes = Number(schedule.start.slice(0, 2)) * 60 + Number(schedule.start.slice(3));
+    const stopMinutes = Number(schedule.stopNewPositions.slice(0, 2)) * 60 + Number(schedule.stopNewPositions.slice(3));
+    const expectedCycles = Math.max(0, Math.floor((stopMinutes - startMinutes) / (config.TRADING_INTERVAL_SECONDS / 60)));
+    const initialUsdt = dailyRow?.initial_equity_usdt === null || dailyRow?.initial_equity_usdt === undefined
+      ? sessionRow?.initial_equity_usdt === null || sessionRow?.initial_equity_usdt === undefined
+        ? accountRow ? num(accountRow.initial_bank_usdt) : null
+        : num(sessionRow.initial_equity_usdt)
+      : num(dailyRow.initial_equity_usdt);
+    const finalUsdt = dailyRow?.final_equity_usdt === null || dailyRow?.final_equity_usdt === undefined
+      ? null
+      : num(dailyRow.final_equity_usdt);
+    const netPnlUsdt = dailyRow?.net_pnl_usdt === null || dailyRow?.net_pnl_usdt === undefined
+      ? operations ? num(operations.net_pnl) : null
+      : num(dailyRow.net_pnl_usdt);
+    const reportInput: DailyReportInput = {
+      date: day,
+      schedule,
+      session: sessionRow ? {
+        phase: String(sessionRow.phase),
+        startedAt: sessionRow.started_at ? new Date(String(sessionRow.started_at)).toISOString() : null,
+        finishedAt: sessionRow.finished_at ? new Date(String(sessionRow.finished_at)).toISOString() : null,
+        cyclesExecuted: num(sessionRow.cycles_today),
+      } : null,
+      bank: { initialUsdt, finalUsdt, netPnlUsdt },
+      operations: {
+        buy: num(operations.buy_count), sell: num(operations.sell_count), hold: num(operations.hold_count),
+        rejectedByRisk: num(operations.rejected_count), forceClose: eventCount('force_close_started') > 0,
+      },
+      ai: { calls: num(usage.calls), costUsd: num(usage.cost_usd), fallbacks: eventCount('ai_fallback'), models },
+      infrastructure: {
+        cyclesExpected: expectedCycles,
+        cyclesExecuted: sessionRow ? num(sessionRow.cycles_today) : 0,
+        maxCycleGapSeconds,
+        workerRestarts: Math.max(0, eventCount('worker_started') - 1),
+        errors: events.filter((row) => String(row.level) === 'ERROR').length,
+        binanceErrors: events.filter((row) => String(row.event) === 'external_service_error' && payloadService(row) === 'binance').length,
+        openRouterErrors: events.filter((row) => String(row.event) === 'ai_error' || (String(row.event) === 'external_service_error' && payloadService(row) === 'openrouter')).length,
+        inconsistencies: eventCount('state_inconsistency_detected'),
+        reconciliationIssues: eventCount('reconciliation_failed'),
+        pendingOrders: num(pendingResult.rows[0].count),
+        rejectedOrders: num(rejectedResult.rows[0].count),
+      },
+      finalState: { openPosition: Boolean(positionResult.rows[0].open_after_end) },
+    };
+    return buildDailyReport(reportInput);
+  }
+  /**
+   * Dashboard read model.  It deliberately selects small, presentation-safe
+   * fields instead of returning database rows or AI raw responses.
+   */
+  async dashboardData(day: string) {
+    if (!isSessionDay(day)) throw new Error('date must use YYYY-MM-DD calendar format');
+    const localDay = [day, config.TRADING_TIMEZONE];
+    const [accountResult, sessionResult, dailyResult, snapshotsResult, tradesResult, decisionsResult, usageResult, eventsResult] = await Promise.all([
+      this.client.query<Row>('select initial_bank_usdt,cash_usdt,realized_pnl_usdt,ai_cost_usd from trading_account order by id limit 1'),
+      this.client.query<Row>('select * from trading_sessions where session_day=$1', [day]),
+      this.client.query<Row>('select * from daily_results where session_day=$1', [day]),
+      this.client.query<Row>(
+        `select cash_usdt,equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,net_pnl_usdt,price,position_quantity,position_cost_usdt,created_at
+         from account_snapshots where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at`, localDay),
+      this.client.query<Row>(
+        `select t.side,t.quantity,t.quote_amount,t.net_quantity,t.net_quote_amount,t.gross_pnl_usdt,t.fees_usdt_known,t.net_pnl_usdt,t.executed_at,o.binance_order_id
+         from trades t join orders o on o.id=t.order_id
+         where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1 order by t.executed_at desc`, localDay),
+      this.client.query<Row>(
+        `select timestamp,model_returned,model_requested,action_requested,action_after_risk,amount_requested,amount_after_risk,confidence,reason,rejection_reason
+         from ai_decisions where to_char(timestamp at time zone $2,'YYYY-MM-DD')=$1 order by timestamp desc limit 100`, localDay),
+      this.client.query<Row>(
+        `select coalesce(nullif(d.model_returned,''),u.model) as model,count(*)::int as calls,
+                coalesce(sum(u.prompt_tokens),0)::int as prompt_tokens,coalesce(sum(u.completion_tokens),0)::int as completion_tokens,
+                coalesce(sum(u.total_tokens),0)::int as total_tokens,coalesce(sum(u.cost_usd),0) as cost_usd
+         from ai_usage u left join ai_decisions d on d.id=u.decision_id
+         where to_char(u.created_at at time zone $2,'YYYY-MM-DD')=$1
+         group by coalesce(nullif(d.model_returned,''),u.model) order by calls desc,model`, localDay),
+      this.client.query<Row>(
+        `select level,event,message,created_at from system_events
+         where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at desc limit 100`, localDay),
+    ]);
+    const account = accountResult.rows[0];
+    const session = sessionResult.rows[0] ?? null;
+    const daily = dailyResult.rows[0] ?? null;
+    const snapshots = snapshotsResult.rows.map((row) => ({
+      at: new Date(String(row.created_at)).toISOString(), cashUsdt: num(row.cash_usdt), equityUsdt: num(row.equity_usdt),
+      realizedPnlUsdt: num(row.realized_pnl_usdt), unrealizedPnlUsdt: num(row.unrealized_pnl_usdt), netPnlUsdt: num(row.net_pnl_usdt),
+      price: num(row.price), positionQuantity: row.position_quantity === null ? null : num(row.position_quantity),
+      positionCostUsdt: row.position_cost_usdt === null ? null : num(row.position_cost_usdt),
+    }));
+    const latest = snapshots.at(-1) ?? null;
+    const initialBankUsdt = daily?.initial_equity_usdt === null || daily?.initial_equity_usdt === undefined
+      ? session?.initial_equity_usdt === null || session?.initial_equity_usdt === undefined
+        ? account ? num(account.initial_bank_usdt) : null : num(session.initial_equity_usdt)
+      : num(daily.initial_equity_usdt);
+    const decisions = decisionsResult.rows.map((row) => ({
+      at: new Date(String(row.timestamp)).toISOString(), model: row.model_returned ?? row.model_requested,
+      actionRequested: row.action_requested, actionAfterRisk: row.action_after_risk,
+      amountRequested: num(row.amount_requested), amountAfterRisk: num(row.amount_after_risk), confidence: num(row.confidence),
+      reason: row.reason, rejectionReason: row.rejection_reason,
+    }));
+    const decisionCounts = { BUY: 0, SELL: 0, HOLD: 0, rejectedByRisk: 0 };
+    for (const decision of decisions) {
+      const action = String(decision.actionAfterRisk) as 'BUY' | 'SELL' | 'HOLD';
+      if (action in decisionCounts) decisionCounts[action]++;
+      if (decision.rejectionReason) decisionCounts.rejectedByRisk++;
+    }
+    const models = usageResult.rows.map((row) => ({ model: String(row.model), calls: num(row.calls), promptTokens: num(row.prompt_tokens), completionTokens: num(row.completion_tokens), totalTokens: num(row.total_tokens), costUsd: num(row.cost_usd) }));
+    const fallbackCount = eventsResult.rows.filter((row) => String(row.event) === 'ai_fallback').length;
+    const errorCount = eventsResult.rows.filter((row) => String(row.level) === 'ERROR').length;
+    const finalEquity = daily?.final_equity_usdt === null || daily?.final_equity_usdt === undefined ? latest?.equityUsdt ?? null : num(daily.final_equity_usdt);
+    const realizedPnlUsdt = daily?.realized_pnl_usdt === null || daily?.realized_pnl_usdt === undefined ? latest?.realizedPnlUsdt ?? 0 : num(daily.realized_pnl_usdt);
+    const unrealizedPnlUsdt = daily?.unrealized_pnl_usdt === null || daily?.unrealized_pnl_usdt === undefined ? latest?.unrealizedPnlUsdt ?? 0 : num(daily.unrealized_pnl_usdt);
+    return {
+      session: session && { day, phase: String(session.phase), timezone: String(session.timezone), startedAt: session.started_at ? new Date(String(session.started_at)).toISOString() : null, finishedAt: session.finished_at ? new Date(String(session.finished_at)).toISOString() : null, lastCycleAt: session.last_cycle_at ? new Date(String(session.last_cycle_at)).toISOString() : null, nextCycleAt: session.next_cycle_at ? new Date(String(session.next_cycle_at)).toISOString() : null, cyclesToday: num(session.cycles_today) },
+      account: { initialBankUsdt, cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null), equityUsdt: finalEquity, aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd) },
+      performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt: daily?.net_pnl_usdt === null || daily?.net_pnl_usdt === undefined ? realizedPnlUsdt + unrealizedPnlUsdt : num(daily.net_pnl_usdt), returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
+      position: latest?.positionQuantity ? { symbol: config.SYMBOL.replace('USDT', ''), quantity: latest.positionQuantity, costUsdt: latest.positionCostUsdt, price: latest.price } : null,
+      decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), binanceOrderId: row.binance_order_id })),
+      aiUsage: { models, fallbacks: fallbackCount, totalTokens: models.reduce((total, model) => total + model.totalTokens, 0), totalCostUsd: models.reduce((total, model) => total + model.costUsd, 0) },
+      events: eventsResult.rows.map((row) => ({ level: row.level, event: row.event, message: row.message, at: new Date(String(row.created_at)).toISOString() })),
+      equityHistory: snapshots.map(({ at, cashUsdt, equityUsdt }) => ({ at, cashUsdt, equityUsdt })),
+      pnlHistory: snapshots.map(({ at, realizedPnlUsdt: realized, netPnlUsdt: total }) => ({ at, realizedPnlUsdt: realized, totalPnlUsdt: total })),
+      summary: daily && { final: daily.final_equity_usdt !== null && daily.final_equity_usdt !== undefined, tradeCount: num(daily.trade_count), buyCount: num(daily.buy_count), sellCount: num(daily.sell_count), holdCount: num(daily.hold_count), rejectedDecisionCount: num(daily.rejected_decision_count), feesUsdtKnown: num(daily.fees_usdt_known), fallbackCount: num(daily.fallback_count), errorCount: num(daily.error_count), forceCloseOccurred: Boolean(daily.forced_close_occurred), openPosition: false },
+      eventCounts: { errors: errorCount },
+    };
   }
   async performance(price: number) {
     const a = await this.account();
     const p = await this.openPosition();
     const unrealized = p ? p.quantity * price - p.costUsdt : 0;
+    const [fees, realizedGross, openingUsdtFees] = await Promise.all([
+      this.feeSummary(),
+      this.client.query<Row>("select coalesce(sum(gross_pnl_usdt),0) as gross from trades where side='SELL'"),
+      p ? this.client.query<Row>(
+        "select coalesce(sum(tf.amount_usdt),0) as fees from trade_fees tf join trades t on t.id=tf.trade_id where t.position_id=$1 and t.side='BUY'",
+        [p.id],
+      ) : Promise.resolve({ rows: [{ fees: 0 }] }),
+    ]);
+    const grossUnrealized = p ? p.quantity * price - (p.costUsdt - num(openingUsdtFees.rows[0].fees)) : 0;
+    const grossPnlUsdt = num(realizedGross.rows[0].gross) + grossUnrealized;
     return {
       initialBankUsdt: a.initialBankUsdt,
       cashUsdt: a.cashUsdt,
       equityUsdt: a.cashUsdt + (p ? p.quantity * price : 0),
       realizedPnlUsdt: a.realizedPnlUsdt,
       unrealizedPnlUsdt: unrealized,
+      grossPnlUsdt,
+      feesUsdtKnown: fees.feesUsdtKnown,
+      netPnlUsdt: a.realizedPnlUsdt + unrealized,
+      feesByAsset: fees.feesByAsset,
       aiCostUsd: a.aiCostUsd,
       tradeCount: Number((await this.client.query('select count(*) from trades')).rows[0].count),
     };

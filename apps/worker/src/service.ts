@@ -3,7 +3,8 @@ import { config, logger, sessionPhase } from '@bolinha/core';
 import { makeSnapshot } from '@bolinha/market-data';
 import { OpenRouterClient, buildPrompt } from '@bolinha/ai';
 import { applyRisk } from '@bolinha/risk-engine';
-import { BinanceTestnetClient, type BinanceGateway } from '@bolinha/exchange';
+import { BinanceTestnetClient, type BinanceGateway, type ExchangeOrder } from '@bolinha/exchange';
+import { executionAccounting } from '@bolinha/database';
 import { TradingRepository } from '@bolinha/database';
 
 type Severity = 'INFO' | 'WARN' | 'ERROR';
@@ -38,23 +39,186 @@ export class TradingService {
     return { action: 'HOLD', reason: 'Another worker is executing a cycle' };
   }
 
-  private async submitAndPersistOrder(side: 'BUY' | 'SELL', quantity: number, amountUsdt: number) {
-    const clientOrderId = randomUUID();
-    const orderId = await this.repo.createPendingOrder(clientOrderId, side, amountUsdt);
-    await this.event('INFO', 'order_submitted', 'Testnet market order submitted', {
-      clientOrderId,
-      side,
-      quantity,
-      amountUsdt,
+  /**
+   * The persisted flag is deliberately checked before every cycle.  A worker
+   * restart is not the only way another process can leave an ambiguous order.
+   */
+  private async tradingReady(): Promise<{ ready: true } | { ready: false; reason: string }> {
+    const reconciliationRepo = this.repo as TradingRepository & {
+      reconciliationState?: () => Promise<{ status: 'OK' | 'RUNNING' | 'ERROR'; stateConsistent: boolean; lastError: string | null }>;
+      pendingOrderCount?: () => Promise<number>;
+    };
+    // Unit-test repositories do not implement the operational state table.
+    if (!reconciliationRepo.reconciliationState || !reconciliationRepo.pendingOrderCount) return { ready: true };
+    const [state, pending] = await Promise.all([
+      reconciliationRepo.reconciliationState(),
+      reconciliationRepo.pendingOrderCount(),
+    ]);
+    if (state.status !== 'OK' || !state.stateConsistent || pending > 0)
+      return {
+        ready: false,
+        reason: state.lastError ?? (pending > 0 ? `${pending} pending order(s) require reconciliation` : `Reconciliation is ${state.status}`),
+      };
+    return { ready: true };
+  }
+
+  private async persistExecution(
+    local: { id: number; clientOrderId: string },
+    order: Pick<ExchangeOrder, 'orderId' | 'side' | 'executedQty' | 'cummulativeQuoteQty' | 'commission' | 'transactTime'> & { fills?: ExchangeOrder['fills'] },
+    eventType: 'normal' | 'reconciliation' = 'normal',
+  ) {
+    const outcome = await this.repo.recordExecution({
+      id: local.id,
+      binanceOrderId: order.orderId,
+      side: order.side,
+      quantity: order.executedQty,
+      quote: order.cummulativeQuoteQty,
+      commission: order.commission,
+      fills: order.fills,
+      at: order.transactTime,
     });
+    // Older lightweight test doubles return void; production repository always
+    // returns the explicit idempotency outcome.
+    const applied = outcome?.applied ?? true;
+    await this.event('INFO', 'order_executed', 'Testnet order executed', {
+      side: order.side,
+      orderId: order.orderId,
+      clientOrderId: local.clientOrderId,
+      quantity: order.executedQty,
+      quoteAmount: order.cummulativeQuoteQty,
+      feesByAsset: executionAccounting(order.side, order.executedQty, order.cummulativeQuoteQty, order.fills ?? []).byAsset,
+      alreadyReconciled: !applied,
+      source: eventType,
+    });
+    if (applied)
+      await this.event(
+        'INFO',
+        order.side === 'BUY' ? 'position_opened' : 'position_closed',
+        'Conceptual position updated',
+        { side: order.side, quantity: order.executedQty, netPositionQuantity: executionAccounting(order.side, order.executedQty, order.cummulativeQuoteQty, order.fills ?? []).positionQuantity, quoteAmount: order.cummulativeQuoteQty, source: eventType },
+      );
+    return outcome;
+  }
+
+  /** Rebuild the conceptual ledger from known application orders only. */
+  async reconcileStateOnStartup() {
+    return this.exclusive(() => this.reconcileStateOnStartupLocked());
+  }
+
+  private async reconcileStateOnStartupLocked() {
+    const reconciliationRepo = this.repo as TradingRepository & {
+      pendingOrders?: () => Promise<Array<{ id: number; clientOrderId: string; side: 'BUY' | 'SELL'; requestedQuantity: number | null }>>;
+      reconciliationStarted?: () => Promise<void>;
+      reconciliationCompleted?: () => Promise<void>;
+      reconciliationFailed?: (error: string) => Promise<void>;
+      stateConsistency?: () => Promise<{ consistent: boolean; reason: string | null }>;
+    };
+    // Keeps small unit-test doubles backwards compatible; real workers always
+    // have all of these methods and therefore fail closed.
+    if (!reconciliationRepo.pendingOrders || !reconciliationRepo.reconciliationStarted || !reconciliationRepo.reconciliationCompleted || !reconciliationRepo.reconciliationFailed || !reconciliationRepo.stateConsistency)
+      return { status: 'OK' as const, pendingOrders: 0 };
+
+    await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+    await reconciliationRepo.reconciliationStarted();
+    try {
+      await this.event('INFO', 'reconciliation_started', 'Startup reconciliation started');
+      // These reads intentionally happen before handling orders: PostgreSQL is
+      // the conceptual source of truth; Binance balances are never inspected.
+      await Promise.all([this.repo.account(), this.repo.openPosition()]);
+      const pendingOrders = await reconciliationRepo.pendingOrders();
+      for (const pending of pendingOrders) {
+        let remote;
+        try {
+          remote = await this.exchange.orderByClientId(pending.clientOrderId);
+        } catch (error) {
+          throw new Error(`Binance unavailable while reconciling ${pending.clientOrderId}: ${error instanceof Error ? error.message : 'unknown error'}`);
+        }
+        if (!remote) {
+          await this.repo.markOrderRejected(pending.id, 'Binance confirmed no order exists for clientOrderId during startup reconciliation');
+          await this.event('INFO', 'pending_order_reconciled', 'Pending order rejected after Binance confirmed it does not exist', {
+            clientOrderId: pending.clientOrderId,
+            outcome: 'REJECTED',
+          });
+          continue;
+        }
+        if (remote.status !== 'FILLED') {
+          const reason = `Binance order ${pending.clientOrderId} is still ${remote.status}`;
+          await this.event('ERROR', 'state_inconsistency_detected', 'Pending order remains ambiguous on Binance', {
+            clientOrderId: pending.clientOrderId,
+            status: remote.status,
+          });
+          throw new Error(reason);
+        }
+        const reconciledQuantity = remote.side === 'SELL'
+          ? executionAccounting(remote.side, remote.executedQty, remote.cummulativeQuoteQty, remote.fills ?? []).positionQuantity
+          : remote.executedQty;
+        if (remote.side !== pending.side || (pending.requestedQuantity !== null && Math.abs(reconciledQuantity - pending.requestedQuantity) > 1e-12)) {
+          const reason = `Binance execution for ${pending.clientOrderId} does not match the local pending order`;
+          await this.event('ERROR', 'state_inconsistency_detected', reason, { clientOrderId: pending.clientOrderId });
+          throw new Error(reason);
+        }
+        const result = await this.persistExecution(pending, remote, 'reconciliation');
+        await this.event('INFO', 'pending_order_reconciled', 'Pending order reconciled from Binance execution', {
+          clientOrderId: pending.clientOrderId,
+        outcome: result.applied ? 'FILLED' : 'ALREADY_RECONCILED',
+        });
+      }
+      const consistency = await reconciliationRepo.stateConsistency();
+      if (!consistency.consistent) {
+        await this.event('ERROR', 'state_inconsistency_detected', 'Ledger consistency check failed after reconciliation', { reason: consistency.reason });
+        throw new Error(consistency.reason ?? 'Ledger consistency check failed');
+      }
+      await reconciliationRepo.reconciliationCompleted();
+      await this.event('INFO', 'reconciliation_completed', 'Startup reconciliation completed', { pendingOrderCount: 0 });
+      return { status: 'OK' as const, pendingOrders: 0 };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown reconciliation error';
+      await reconciliationRepo.reconciliationFailed(message);
+      await this.event('ERROR', 'reconciliation_failed', 'Startup reconciliation failed; trading remains blocked', { error: message });
+      throw error;
+    }
+  }
+
+  private async submitAndPersistOrder(side: 'BUY' | 'SELL', quantity: number, amountUsdt: number) {
+    const pendingRepository = this.repo as TradingRepository & {
+      pendingOrderDetails?: () => Promise<{
+        id: number;
+        clientOrderId: string;
+        side: 'BUY' | 'SELL';
+        requestedAmount: number;
+        requestedQuantity: number | null;
+      } | null>;
+    };
+    const pending = pendingRepository.pendingOrderDetails ? await pendingRepository.pendingOrderDetails() : null;
+    if (pending && pending.side !== side)
+      throw new Error(`Cannot submit ${side} while pending ${pending.side} order ${pending.clientOrderId} is unresolved`);
+    if (pending && pending.requestedQuantity !== null && Math.abs(pending.requestedQuantity - quantity) > 1e-12)
+      throw new Error('Pending order quantity differs from the full conceptual position');
+    const clientOrderId = pending?.clientOrderId ?? randomUUID();
+    const orderId = pending?.id ?? await this.repo.createPendingOrder(clientOrderId, side, amountUsdt, quantity);
+    if (!pending)
+      await this.event('INFO', 'order_submitted', 'Testnet market order submitted', {
+        clientOrderId,
+        side,
+        quantity,
+        amountUsdt,
+      });
     let order;
     try {
-      order = await this.exchange.placeMarketOrder(side, quantity, clientOrderId);
+      order = pending ? await this.exchange.orderByClientId(clientOrderId) : null;
+      if (!order) {
+        if (pending)
+          await this.event('WARN', 'pending_order_retry', 'Retrying unresolved Testnet order with the same client order id', {
+            clientOrderId,
+            side,
+            quantity,
+          });
+        order = await this.exchange.placeMarketOrder(side, quantity, clientOrderId);
+      }
     } catch (error) {
       order = await this.exchange.orderByClientId(clientOrderId);
       if (!order) {
         const message = error instanceof Error ? error.message : 'Unknown order submission error';
-        await this.repo.markOrderRejected(orderId);
         await this.event('ERROR', 'external_service_error', 'Testnet order could not be verified', {
           service: 'binance',
           clientOrderId,
@@ -63,28 +227,12 @@ export class TradingService {
         throw error;
       }
     }
-    await this.repo.recordExecution({
-      id: orderId,
-      binanceOrderId: order.orderId,
-      side: order.side,
-      quantity: order.executedQty,
-      quote: order.cummulativeQuoteQty,
-      commission: order.commission,
-      at: order.transactTime,
-    });
-    await this.event('INFO', 'order_executed', 'Testnet order executed', {
-      side: order.side,
-      orderId: order.orderId,
-      clientOrderId,
-      quantity: order.executedQty,
-      quoteAmount: order.cummulativeQuoteQty,
-    });
-    await this.event(
-      'INFO',
-      order.side === 'BUY' ? 'position_opened' : 'position_closed',
-      'Conceptual position updated',
-      { side: order.side, quantity: order.executedQty, quoteAmount: order.cummulativeQuoteQty },
-    );
+    const fulfilledQuantity = order.side === 'SELL'
+      ? executionAccounting(order.side, order.executedQty, order.cummulativeQuoteQty, order.fills ?? []).positionQuantity
+      : order.executedQty;
+    if (order.status !== 'FILLED' || order.side !== side || Math.abs(fulfilledQuantity - quantity) > 1e-12)
+      throw new Error('Refusing to persist an execution that does not fully match the requested quantity');
+    await this.persistExecution({ id: orderId, clientOrderId }, order);
     return order;
   }
 
@@ -95,12 +243,17 @@ export class TradingService {
   private async runOnceLocked(at: Date) {
     await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
     await this.repo.heartbeat();
-    const phase = sessionPhase(at);
+    const ready = await this.tradingReady();
+    if (!ready.ready) {
+      await this.event('WARN', 'cycle_skipped', 'Trading cycle blocked pending reconciliation', { reason: ready.reason });
+      return { action: 'HOLD' as const, reason: ready.reason };
+    }
+    const phase = sessionPhase(at, undefined, Boolean(await this.repo.openPosition()));
     if (phase === 'BEFORE_START' || phase === 'FINISHED') {
       await this.event('INFO', 'cycle_skipped', 'Trading cycle skipped outside the daily session', { phase });
       return { action: 'HOLD' as const, reason: `Session phase is ${phase}` };
     }
-    if (phase === 'FORCE_CLOSE') return this.forceClosePositionLocked();
+    if (phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING') return this.forceClosePositionLocked();
     await this.event('INFO', 'cycle_started', 'Trading cycle started', { symbol: config.SYMBOL });
     try {
       let market;
@@ -127,6 +280,11 @@ export class TradingService {
       const [one, five, fifteen, account, position, rules, pending] = market;
       const snapshot = makeSnapshot(config.SYMBOL, { '1m': one, '5m': five, '15m': fifteen });
       const snapshotId = await this.repo.saveSnapshot(snapshot);
+      // One compact point per cycle keeps dashboard charts historical without
+      // making the browser poll Binance or the database directly.
+      const dashboardRepo = this.repo as TradingRepository & { saveAccountSnapshot?: (price: number, at: Date) => Promise<void> };
+      if (dashboardRepo.saveAccountSnapshot)
+        await dashboardRepo.saveAccountSnapshot(snapshot.intervals['1m'].price, at);
       const response = await this.ai.decide(buildPrompt(snapshot, account, position));
       if (response.usage.fallbackUsed)
         await this.event('WARN', 'ai_fallback', 'OpenRouter fallback model was used', {
@@ -204,20 +362,29 @@ export class TradingService {
 
   private async forceClosePositionLocked() {
     await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+    const ready = await this.tradingReady();
+    if (!ready.ready) {
+      await this.event('WARN', 'force_close_blocked', 'Forced close blocked pending reconciliation', { reason: ready.reason });
+      return { action: 'HOLD' as const, reason: ready.reason };
+    }
     await this.event('WARN', 'force_close_started', 'Forced close requested', { symbol: config.SYMBOL });
     try {
-    const [position, account, rules, price] = await Promise.all([
-      this.repo.openPosition(),
-      this.repo.account(),
-      this.exchange.rules(),
-      this.exchange.price(),
-    ]);
+    const position = await this.repo.openPosition();
     if (!position) {
       await this.event('INFO', 'force_close_completed', 'No conceptual position to close', {
         action: 'HOLD',
       });
       return { action: 'HOLD', reason: 'No open conceptual position' };
     }
+    const [account, rules, price] = await Promise.all([
+      this.repo.account(),
+      this.exchange.rules(),
+      this.exchange.price(),
+    ]);
+    const pendingRepository = this.repo as TradingRepository & {
+      pendingOrderDetails?: () => Promise<{ side: 'BUY' | 'SELL' } | null>;
+    };
+    const pending = pendingRepository.pendingOrderDetails ? await pendingRepository.pendingOrderDetails() : null;
     const risk = applyRisk({
       action: 'SELL',
       requestedUsdt: position.quantity * price,
@@ -226,7 +393,9 @@ export class TradingService {
       position,
       rules,
       maxPositionPercent: config.MAX_POSITION_PERCENT,
-      duplicateOrderPending: await this.repo.pendingOrder(),
+      // A pending SELL is retried with its persisted client id below. A pending
+      // BUY is never retried during the close-only window.
+      duplicateOrderPending: pending ? pending.side !== 'SELL' : await this.repo.pendingOrder(),
     });
     if (risk.action === 'HOLD') {
       await this.event('WARN', 'decision_rejected_by_risk', 'Forced close rejected by risk engine', {
@@ -291,6 +460,7 @@ export class TradingService {
     let positionOpened = false;
     try {
       const buyOrder = await this.submitAndPersistOrder('BUY', risk.quantity, risk.amountUsdt);
+      const buyAccounting = executionAccounting('BUY', buyOrder.executedQty, buyOrder.cummulativeQuoteQty, buyOrder.fills ?? []);
       positionOpened = true;
       const accountAfterBuy = await this.repo.account();
       const positionAfterBuy = await this.repo.openPosition();
@@ -321,6 +491,7 @@ export class TradingService {
       )
         throw new Error('Smoke test final persistence verification failed');
       const pnl = finalAccount.realizedPnlUsdt - initialAccount.realizedPnlUsdt;
+      const sellTrade = trades.find((trade) => trade.side === 'SELL');
       await this.event('INFO', 'smoke_test_completed', 'Real Binance Spot Testnet smoke test completed', {
         buyOrderId: buyOrder.orderId,
         sellOrderId,
@@ -329,12 +500,19 @@ export class TradingService {
       return {
         initialCashUsdt: initialAccount.cashUsdt,
         requestedUsdt,
+        buyGrossQuantity: buyOrder.executedQty,
+        buyFeesByAsset: buyAccounting.byAsset,
+        buyNetPositionQuantity: positionAfterBuy.quantity,
         buyQuantity: buyOrder.executedQty,
-        buyCostUsdt: buyOrder.cummulativeQuoteQty,
+        buyCostUsdt: positionAfterBuy.costUsdt,
         cashAfterBuy: accountAfterBuy.cashUsdt,
         positionCostUsdt: positionAfterBuy.costUsdt,
-        sellQuantity: positionAfterBuy.quantity,
-        sellReceivedUsdt: finalAccount.cashUsdt - accountAfterBuy.cashUsdt,
+        sellQuantity: Number(sellTrade?.quantity ?? positionAfterBuy.quantity),
+        sellGrossReceivedUsdt: Number(sellTrade?.quote_amount ?? finalAccount.cashUsdt - accountAfterBuy.cashUsdt),
+        sellFeesByAsset: sellTrade?.fees_by_asset ?? {},
+        sellReceivedUsdt: Number(sellTrade?.net_quote_amount ?? finalAccount.cashUsdt - accountAfterBuy.cashUsdt),
+        grossPnlUsdt: Number(sellTrade?.gross_pnl_usdt ?? pnl),
+        netPnlUsdt: Number(sellTrade?.net_pnl_usdt ?? pnl),
         tradePnlUsdt: pnl,
         cashAfterSell: finalAccount.cashUsdt,
         realizedPnlUsdt: finalAccount.realizedPnlUsdt,

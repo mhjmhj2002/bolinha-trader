@@ -4,11 +4,21 @@ import type { Action, SymbolRules } from '@bolinha/core';
 export interface ExchangeOrder {
   clientOrderId: string;
   orderId: string;
+  status: string;
   side: 'BUY' | 'SELL';
   executedQty: number;
   cummulativeQuoteQty: number;
+  fills: ExchangeFill[];
+  /** Kept for compatibility with callers predating per-fill accounting. */
   commission: number;
   transactTime: Date;
+}
+export interface ExchangeFill {
+  price: number;
+  qty: number;
+  commission: number;
+  commissionAsset: string;
+  tradeId?: string | null;
 }
 export interface BinanceGateway {
   candles(interval: '1m' | '5m' | '15m', limit?: number): Promise<Candle[]>;
@@ -108,12 +118,17 @@ export class BinanceTestnetClient implements BinanceGateway {
   }
   async orderByClientId(clientOrderId: string): Promise<ExchangeOrder | null> {
     try {
-      return this.mapOrder(
-        await this.signed(
+      const order = await this.signed(
           '/api/v3/order',
           new URLSearchParams({ symbol: this.symbol, origClientOrderId: clientOrderId }),
-        ),
-      );
+        );
+      // GET /order does not include fills. Fetching the account trades is what
+      // makes crash recovery use the same fee evidence as the original FULL
+      // order response.
+      const fills = order.status === 'FILLED'
+        ? await this.signed('/api/v3/myTrades', new URLSearchParams({ symbol: this.symbol, orderId: String(order.orderId) }))
+        : [];
+      return this.mapOrder(order, fills);
     } catch (error) {
       if (error instanceof Error && error.message.includes('(-2013)')) return null;
       throw error;
@@ -135,14 +150,24 @@ export class BinanceTestnetClient implements BinanceGateway {
       return false;
     }
   }
-  private mapOrder(data: any): ExchangeOrder {
+  private mapOrder(data: any, fillsOverride?: any[]): ExchangeOrder {
+    const rawFills = fillsOverride ?? data.fills ?? [];
+    const fills: ExchangeFill[] = rawFills.map((f: any) => ({
+      price: +f.price,
+      qty: +f.qty,
+      commission: +f.commission || 0,
+      commissionAsset: String(f.commissionAsset ?? ''),
+      tradeId: f.tradeId === undefined && f.id === undefined ? null : String(f.tradeId ?? f.id),
+    }));
     return {
       clientOrderId: data.clientOrderId,
       orderId: String(data.orderId),
+      status: String(data.status),
       side: data.side,
       executedQty: +data.executedQty,
       cummulativeQuoteQty: +data.cummulativeQuoteQty,
-      commission: (data.fills ?? []).reduce((s: any, f: any) => s + (+f.commission || 0), 0),
+      fills,
+      commission: fills.reduce((sum, fill) => sum + fill.commission, 0),
       transactTime: new Date(data.transactTime),
     };
   }
