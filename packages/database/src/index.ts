@@ -1,6 +1,6 @@
 import pg from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { buildDailyReport, config, defaultTradingConfiguration, isSessionDay, sessionDay, sessionPhase, sessionSchedule, validateTradingConfiguration, type Account, type DailyReport, type DailyReportInput, type Position, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
+import { buildDailyReport, calculateExpectedDecisionCycles, config, defaultTradingConfiguration, isSessionDay, sessionDay, sessionPhase, sessionSchedule, validateTradingConfiguration, type Account, type DailyReport, type DailyReportInput, type Position, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
 import type { AiDecision, AiUsage } from '@bolinha/ai';
 import type { MarketSnapshot } from '@bolinha/market-data';
 import { executionAccounting, type ExecutionFill } from './accounting.js';
@@ -33,16 +33,34 @@ export type ReconciliationState = {
 };
 export type ConfigurationEditability = {
   editable: boolean;
-  blockedReason: 'TRADING_SESSION_ACTIVE' | 'OPEN_POSITION' | 'PENDING_ORDER' | 'RECONCILIATION_NOT_OK' | 'TRADING_OPERATION_IN_PROGRESS' | null;
+  reason: ConfigurationBlockReason | null;
+  message: string | null;
+  /** @deprecated Use reason. Kept for existing dashboard/API consumers. */
+  blockedReason: ConfigurationBlockReason | null;
   sessionPhase: SessionPhase;
   openPosition: boolean;
   pendingOrders: number;
   reconciliationStatus: ReconciliationState['status'];
   stateConsistent: boolean;
 };
+export type ConfigurationBlockReason =
+  | 'LOOP_ACTIVE'
+  | 'OPEN_POSITION'
+  | 'PENDING_ORDER'
+  | 'RECONCILIATION_NOT_OK'
+  | 'CYCLE_RUNNING'
+  | 'FORCE_CLOSE_RUNNING';
+const configurationBlockMessage: Record<ConfigurationBlockReason, string> = {
+  LOOP_ACTIVE: 'Trading em execução. A configuração não pode ser alterada durante a sessão ativa.',
+  OPEN_POSITION: 'Existe uma posição aberta. Feche a posição antes de alterar a configuração.',
+  PENDING_ORDER: 'Existe uma ordem pendente de reconciliação.',
+  RECONCILIATION_NOT_OK: 'A configuração está bloqueada enquanto a reconciliação não estiver OK.',
+  CYCLE_RUNNING: 'Um ciclo operacional está em execução. Aguarde a conclusão para alterar a configuração.',
+  FORCE_CLOSE_RUNNING: 'O force close está em andamento. Aguarde o encerramento para alterar a configuração.',
+};
 export class ConfigurationBlockedError extends Error {
   constructor(public readonly state: ConfigurationEditability) {
-    super('Trading em execução. Configuração operacional não pode ser alterada agora.');
+    super(state.message ?? 'Configuração operacional não pode ser alterada agora.');
     this.name = 'ConfigurationBlockedError';
   }
 }
@@ -51,6 +69,36 @@ const configurationMetadata = (configuration: TradingConfiguration) => ({
   forceCloseTime: configuration.forceClose, endTime: configuration.end, intervalSeconds: configuration.intervalSeconds,
   initialBankUsdt: configuration.initialBankUsdt, maxPositionPercent: configuration.maxPositionPercent,
 });
+export const configurationEditabilityFromState = (
+  at: Date,
+  configuration: TradingConfiguration,
+  loopEnabled: boolean,
+  hasOpenPosition: boolean,
+  pendingOrders: number,
+  reconciliation: ReconciliationState,
+  operationRunning = false,
+): ConfigurationEditability => {
+  const phase = sessionPhase(at, configuration, hasOpenPosition);
+  const activeSession = phase !== 'BEFORE_START' && phase !== 'FINISHED';
+  const reason: ConfigurationBlockReason | null =
+    operationRunning ? (phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING' ? 'FORCE_CLOSE_RUNNING' : 'CYCLE_RUNNING')
+      : hasOpenPosition ? 'OPEN_POSITION'
+        : pendingOrders > 0 ? 'PENDING_ORDER'
+          : reconciliation.status !== 'OK' || !reconciliation.stateConsistent ? 'RECONCILIATION_NOT_OK'
+            : loopEnabled && activeSession ? 'LOOP_ACTIVE'
+              : null;
+  return {
+    editable: reason === null,
+    reason,
+    message: reason ? configurationBlockMessage[reason] : null,
+    blockedReason: reason,
+    sessionPhase: phase,
+    openPosition: hasOpenPosition,
+    pendingOrders,
+    reconciliationStatus: reconciliation.status,
+    stateConsistent: reconciliation.stateConsistent,
+  };
+};
 export class TradingRepository {
   constructor(private client: pg.Pool = pool) {}
   async health() {
@@ -79,25 +127,26 @@ export class TradingRepository {
   }
   async configurationEditability(at = new Date(), configuration?: TradingConfiguration): Promise<ConfigurationEditability> {
     configuration ??= await this.configuration();
-    const [position, pendingOrders, reconciliation, session] = await Promise.all([
+    const [position, pendingOrders, reconciliation, operationRunning] = await Promise.all([
       this.openPosition(), this.pendingOrderCount(), this.reconciliationState(),
-      this.session(at, configuration.timezone),
+      this.tradingOperationRunning(),
     ]);
-    return this.editabilityFromState(at, configuration, Boolean(position), pendingOrders, reconciliation, session?.phase as SessionPhase | undefined);
+    return this.editabilityFromState(at, configuration, Boolean(position), pendingOrders, reconciliation, operationRunning);
+  }
+  /** A non-blocking probe of the worker's advisory lock for the configuration UI. */
+  private async tradingOperationRunning(): Promise<boolean> {
+    const connection = await this.client.connect();
+    try {
+      const result = await connection.query<{ acquired: boolean }>("select pg_try_advisory_lock(hashtext('bolinha-trading-cycle')) as acquired");
+      if (!result.rows[0]?.acquired) return true;
+      await connection.query("select pg_advisory_unlock(hashtext('bolinha-trading-cycle'))");
+      return false;
+    } finally { connection.release(); }
   }
   private editabilityFromState(
-    at: Date, configuration: TradingConfiguration, hasOpenPosition: boolean, pendingOrders: number, reconciliation: ReconciliationState, persistedPhase?: SessionPhase,
+    at: Date, configuration: TradingConfiguration, hasOpenPosition: boolean, pendingOrders: number, reconciliation: ReconciliationState, operationRunning = false,
   ): ConfigurationEditability {
-    const clockPhase = sessionPhase(at, configuration, hasOpenPosition);
-    const persistedActive = persistedPhase && ['TRADING', 'NO_NEW_POSITIONS', 'FORCE_CLOSE', 'FORCE_CLOSE_PENDING'].includes(persistedPhase);
-    const phase = persistedActive ? persistedPhase : clockPhase;
-    const activePhase = ['TRADING', 'NO_NEW_POSITIONS', 'FORCE_CLOSE', 'FORCE_CLOSE_PENDING'].includes(phase);
-    const blockedReason = activePhase ? 'TRADING_SESSION_ACTIVE'
-      : hasOpenPosition ? 'OPEN_POSITION'
-        : pendingOrders > 0 ? 'PENDING_ORDER'
-          : reconciliation.status !== 'OK' || !reconciliation.stateConsistent ? 'RECONCILIATION_NOT_OK'
-            : null;
-    return { editable: blockedReason === null, blockedReason, sessionPhase: phase, openPosition: hasOpenPosition, pendingOrders, reconciliationStatus: reconciliation.status, stateConsistent: reconciliation.stateConsistent };
+    return configurationEditabilityFromState(at, configuration, config.TRADING_LOOP_ENABLED, hasOpenPosition, pendingOrders, reconciliation, operationRunning);
   }
   /**
    * Changes the singleton live row and appends an immutable version in the
@@ -120,27 +169,24 @@ export class TradingRepository {
         'INFO', 'configuration_update_attempted', 'Operational configuration update attempted', serializeJsonb(attemptedPayload), at,
       ]);
       if (!configurationLock.rows[0]?.acquired || !tradingLock.rows[0]?.acquired) {
-        const state: ConfigurationEditability = {
-          editable: false, blockedReason: 'TRADING_OPERATION_IN_PROGRESS', sessionPhase: sessionPhase(at, current),
-          openPosition: false, pendingOrders: 0, reconciliationStatus: 'RUNNING', stateConsistent: false,
-        };
+        const state = configurationEditabilityFromState(at, current, config.TRADING_LOOP_ENABLED, false, 0,
+          { status: 'RUNNING', stateConsistent: false, lastReconciliationAt: null, lastError: null }, true);
         await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
           'WARN', 'configuration_update_blocked', 'Operational configuration update blocked', serializeJsonb({ ...attemptedPayload, reason: state.blockedReason }), at,
         ]);
         await connection.query('commit');
         throw new ConfigurationBlockedError(state);
       }
-      const [positionResult, pendingResult, reconciliationResult, sessionResult] = await Promise.all([
+      const [positionResult, pendingResult, reconciliationResult] = await Promise.all([
         connection.query("select 1 from positions where status='OPEN' limit 1"),
         connection.query("select count(*) from orders where status='PENDING'"),
         connection.query<Row>('select * from reconciliation_state where id=true'),
-        connection.query<Row>('select phase from trading_sessions where session_day=$1', [sessionDay(at, current.timezone)]),
       ]);
       const reconciliationRow = reconciliationResult.rows[0];
       const reconciliation: ReconciliationState = !reconciliationRow
         ? { status: 'ERROR', stateConsistent: false, lastReconciliationAt: null, lastError: 'Startup reconciliation has not run' }
         : { status: String(reconciliationRow.status) as ReconciliationState['status'], stateConsistent: Boolean(reconciliationRow.state_consistent), lastReconciliationAt: reconciliationRow.last_reconciled_at ? new Date(String(reconciliationRow.last_reconciled_at)) : null, lastError: reconciliationRow.last_error === null ? null : String(reconciliationRow.last_error) };
-      const state = this.editabilityFromState(at, current, positionResult.rows.length > 0, Number(pendingResult.rows[0].count), reconciliation, sessionResult.rows[0]?.phase as SessionPhase | undefined);
+      const state = this.editabilityFromState(at, current, positionResult.rows.length > 0, Number(pendingResult.rows[0].count), reconciliation);
       if (!state.editable) {
         await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
           'WARN', 'configuration_update_blocked', 'Operational configuration update blocked', serializeJsonb({ ...attemptedPayload, reason: state.blockedReason }), at,
@@ -804,9 +850,12 @@ export class TradingRepository {
       maxCycleGapSeconds = Math.max(maxCycleGapSeconds ?? 0, seconds);
     }
     const models = Object.fromEntries(modelResult.rows.map((row) => [String(row.model), num(row.calls)]));
-    const startMinutes = Number(schedule.start.slice(0, 2)) * 60 + Number(schedule.start.slice(3));
-    const stopMinutes = Number(schedule.stopNewPositions.slice(0, 2)) * 60 + Number(schedule.stopNewPositions.slice(3));
-    const expectedCycles = Math.max(0, Math.floor((stopMinutes - startMinutes) / (schedule.intervalSeconds / 60)));
+    const expectedCycles = calculateExpectedDecisionCycles({
+      sessionDay: day,
+      schedule,
+      actualTradingStart: sessionRow?.started_at ? new Date(String(sessionRow.started_at)) : null,
+      finishedAt: sessionRow?.finished_at ? new Date(String(sessionRow.finished_at)) : null,
+    });
     const initialUsdt = dailyRow?.initial_equity_usdt === null || dailyRow?.initial_equity_usdt === undefined
       ? sessionRow?.initial_equity_usdt === null || sessionRow?.initial_equity_usdt === undefined
         ? accountRow ? num(accountRow.initial_bank_usdt) : null
@@ -842,8 +891,9 @@ export class TradingRepository {
       },
       ai: { calls: num(usage.calls), costUsd: num(usage.cost_usd), fallbacks: eventCount('ai_fallback'), models },
       infrastructure: {
-        cyclesExpected: expectedCycles,
+        cyclesExpected: expectedCycles.expectedDecisionCycles,
         cyclesExecuted: num(operations.decision_count ?? 0),
+        effectiveStartAt: expectedCycles.effectiveStartAt?.toISOString() ?? null,
         operationalChecks: Math.max(num(sessionRow?.operational_checks ?? 0), num(sessionRow?.cycles_today ?? 0) - num(operations.decision_count ?? 0)),
         forceCloseAttempts: num(sessionRow?.force_close_attempts ?? 0),
         reconciliationRuns: num(sessionRow?.reconciliation_runs ?? 0),

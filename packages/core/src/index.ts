@@ -57,6 +57,86 @@ export const isSessionDay = (value: string) => {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 };
 export const localTime = (at = new Date(), timezone: string = defaultTradingConfiguration.timezone) => { const p = localParts(at, timezone); return `${p.hour}:${p.minute}:${p.second}`; };
+/** Formats an instant for an operator without changing the UTC instant stored in PostgreSQL. */
+export const formatOperationalDateTime = (at: Date, timezone: string = defaultTradingConfiguration.timezone) => {
+  const p = localParts(at, timezone);
+  return `${p.day}/${p.month}/${p.year} ${p.hour}:${p.minute}:${p.second}`;
+};
+
+const secondsOfDay = (time: string) => {
+  const [hour, minute, second = 0] = time.split(':').map(Number);
+  return hour * 3_600 + minute * 60 + second;
+};
+
+/** Turns a local session date/time into its UTC instant without relying on the
+ * process timezone. The small correction loop also keeps named IANA timezones
+ * correct when their UTC offset changes. */
+const atSessionTime = (day: string, time: string, timezone: string) => {
+  const [year, month, date] = day.split('-').map(Number);
+  const [hour, minute, second = 0] = time.split(':').map(Number);
+  const desired = Date.UTC(year, month - 1, date, hour, minute, second);
+  let candidate = new Date(desired);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (Number.isNaN(candidate.getTime())) throw new Error(`Invalid session time: ${day} ${time}`);
+    const local = localParts(candidate, timezone);
+    const observed = Date.UTC(Number(local.year), Number(local.month) - 1, Number(local.day), Number(local.hour), Number(local.minute), Number(local.second));
+    const adjustment = desired - observed;
+    if (adjustment === 0) break;
+    candidate = new Date(candidate.getTime() + adjustment);
+  }
+  return candidate;
+};
+
+export type ExpectedDecisionCycles = {
+  expectedDecisionCycles: number;
+  effectiveStartAt: Date | null;
+  effectiveEndAt: Date | null;
+};
+
+/**
+ * Counts the decision-cycle opportunities produced by the current scheduler:
+ * one immediate run when the loop first reaches TRADING, followed by the
+ * fixed slots anchored at the configured start. Close-only phases are never
+ * included. `actualTradingStart` is intentionally retained across restarts,
+ * so downtime after that first activation remains visible as missed slots.
+ */
+export const calculateExpectedDecisionCycles = ({
+  sessionDay: day,
+  schedule,
+  actualTradingStart,
+  finishedAt = null,
+  nowAt = new Date(),
+}: {
+  sessionDay: string;
+  schedule: SessionSchedule;
+  actualTradingStart: Date | string | null;
+  finishedAt?: Date | string | null;
+  nowAt?: Date;
+}): ExpectedDecisionCycles => {
+  const configuredStart = atSessionTime(day, schedule.start, schedule.timezone);
+  const stopNewPositions = atSessionTime(day, schedule.stopNewPositions, schedule.timezone);
+  const actualStart = actualTradingStart === null ? null : new Date(actualTradingStart);
+  if (!actualStart || Number.isNaN(actualStart.getTime()))
+    return { expectedDecisionCycles: 0, effectiveStartAt: null, effectiveEndAt: null };
+  const effectiveStartAt = new Date(Math.max(configuredStart.getTime(), actualStart.getTime()));
+  const completedAt = finishedAt === null ? null : new Date(finishedAt);
+  const endCandidate = completedAt && !Number.isNaN(completedAt.getTime()) ? completedAt : nowAt;
+  const effectiveEndAt = new Date(Math.min(stopNewPositions.getTime(), endCandidate.getTime()));
+  if (effectiveStartAt >= effectiveEndAt)
+    return { expectedDecisionCycles: 0, effectiveStartAt, effectiveEndAt };
+
+  // The immediate startup run is a real decision opportunity. Subsequent
+  // opportunities are precisely the fixed wall-clock slots scheduled after it.
+  let expectedDecisionCycles = 1;
+  const startSeconds = secondsOfDay(schedule.start);
+  const stopSeconds = secondsOfDay(schedule.stopNewPositions);
+  for (let seconds = startSeconds; seconds < stopSeconds; seconds += schedule.intervalSeconds) {
+    const slotTime = `${String(Math.floor(seconds / 3_600)).padStart(2, '0')}:${String(Math.floor((seconds % 3_600) / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+    const slot = atSessionTime(day, slotTime, schedule.timezone);
+    if (slot > effectiveStartAt && slot < effectiveEndAt) expectedDecisionCycles++;
+  }
+  return { expectedDecisionCycles, effectiveStartAt, effectiveEndAt };
+};
 /**
  * After the scheduled end, an open conceptual position keeps the worker in a
  * close-only state.  The caller supplies this persisted fact so a restart has
@@ -122,6 +202,7 @@ export type DailyReportInput = {
   infrastructure: {
     cyclesExpected: number;
     cyclesExecuted: number;
+    effectiveStartAt?: string | null;
     maxCycleGapSeconds: number | null;
     workerRestarts: number;
     errors: number;
@@ -165,7 +246,7 @@ export const buildDailyReport = (input: DailyReportInput): DailyReport => {
     ? 'CONCLUÍDA'
     : input.session?.phase === 'FINISHED' ? 'INCOMPLETA' : input.session ? 'EM ANDAMENTO' : 'INCOMPLETA';
   const { infrastructure } = input;
-  const intervalSeconds = Math.max(1, Math.round((
+  const intervalSeconds = Math.max(1, input.schedule.intervalSeconds || Math.round((
     ((Number(input.schedule.stopNewPositions.slice(0, 2)) * 60 + Number(input.schedule.stopNewPositions.slice(3))) -
       (Number(input.schedule.start.slice(0, 2)) * 60 + Number(input.schedule.start.slice(3)))) /
     Math.max(1, input.infrastructure.cyclesExpected)
@@ -230,6 +311,7 @@ export const formatDailyReport = (report: DailyReport): string => {
     '',
     'Sessão',
     `${report.schedule.start} → ${report.schedule.end}`,
+    `Fuso: ${report.schedule.timezone}`,
     `Status: ${report.status}`,
     '',
     'Banca',
@@ -254,8 +336,11 @@ export const formatDailyReport = (report: DailyReport): string => {
     ...(models.length ? models : ['Nenhum modelo utilizado.']),
     '',
     'Infraestrutura',
+    `Início configurado: ${report.schedule.start}`,
+    `Início efetivo: ${report.infrastructure.effectiveStartAt ? localTime(new Date(report.infrastructure.effectiveStartAt), report.schedule.timezone).slice(0, 5) : '—'}`,
     `Ciclos esperados: ${report.infrastructure.cyclesExpected}`,
     `Decision cycles executados: ${report.infrastructure.cyclesExecuted}`,
+    `Decision cycles perdidos: ${Math.max(0, report.infrastructure.cyclesExpected - report.infrastructure.cyclesExecuted)}`,
     `Operational checks: ${report.infrastructure.operationalChecks ?? 0}`,
     `Force-close attempts: ${report.infrastructure.forceCloseAttempts ?? 0}`,
     `Reconciliações: ${report.infrastructure.reconciliationRuns ?? 0}`,

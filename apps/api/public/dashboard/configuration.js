@@ -12,7 +12,7 @@
     alert.className = `alert ${state.editable ? 'alert-info' : 'alert-danger'}`;
     alert.textContent = state.editable
       ? 'Configuração editável. As alterações afetarão as próximas sessões de trading.'
-      : 'Trading em execução. Escolha um horário fora da janela de execução para atualizar estes dados.';
+      : (state.message || 'A configuração está bloqueada por uma operação em andamento.');
   };
   const load = async () => {
     const response = await fetch('/configuration');

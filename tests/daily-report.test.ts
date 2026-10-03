@@ -20,6 +20,9 @@ describe('daily operational report', () => {
     expect(report.operations).toMatchObject({ buy: 0, sell: 0, hold: 53 });
     expect(report.operationalResult).toBe('OK');
     expect(formatDailyReport(report)).toContain('Posição aberta: NÃO');
+    expect(formatDailyReport(report)).toContain('Início configurado: 09:00');
+    expect(formatDailyReport(report)).toContain('Decision cycles perdidos: 0');
+    expect(report.diagnostics.map((diagnostic) => diagnostic.code)).not.toContain('CYCLE_MISSED');
   });
 
   it('calculates positive and negative return from the persisted bank snapshots', () => {
@@ -54,6 +57,18 @@ describe('daily operational report', () => {
     }));
     expect(report.status).toBe('EM ANDAMENTO');
     expect(report.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(expect.arrayContaining(['SESSION_INCOMPLETE', 'CYCLE_MISSED', 'CYCLE_DELAYED']));
+  });
+
+  it.each([
+    ['worker restart from 12:00 to 12:30'],
+    ['manual loop pause from 15:00 to 16:00'],
+  ])('keeps post-start downtime visible as missed cycles (%s)', () => {
+    const report = buildDailyReport(input({
+      infrastructure: { ...input().infrastructure, cyclesExpected: 53, cyclesExecuted: 49 },
+    }));
+    expect(report.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'CYCLE_MISSED', count: 4 }),
+    ]));
   });
 
   it('keeps a safe OpenRouter HOLD as attention, while unsafe state remains critical', () => {

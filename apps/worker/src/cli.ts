@@ -1,11 +1,12 @@
 import { TradingService } from './service.js';
-import { config, formatDailyReport, localTime, sessionDay, sessionPhase } from '@bolinha/core';
+import { config, formatDailyReport, formatOperationalDateTime, localTime, sessionDay, sessionPhase } from '@bolinha/core';
 import { TradingRepository } from '@bolinha/database';
 import { BinanceTestnetClient } from '@bolinha/exchange';
 import { finishDailyIfPositionClosed } from './lifecycle.js';
 const service = new TradingService();
 const command = process.argv[2];
 const money = (value: number) => value.toFixed(8);
+const operatorTime = (value: unknown, timezone: string) => value ? formatOperationalDateTime(new Date(String(value)), timezone) : null;
 if (command === 'once') console.log(JSON.stringify(await service.runOnce()));
 else if (command === 'force-close') console.log(JSON.stringify(await service.forceClosePosition()));
 else if (command === 'report-today') {
@@ -31,7 +32,7 @@ else if (command === 'finalize-today') {
 else if (command === 'status' || command === 'day-test-check') {
   const repo = new TradingRepository(); const operational = await repo.configuration(); await repo.ensureAccount(operational.initialBankUsdt);
   const [account, position, state, daily, dailyResultStatus] = await Promise.all([repo.account(), repo.openPosition(), repo.session(new Date(), operational.timezone), repo.dailyResult(), repo.dailyResultStatus()]);
-  const output = { loopEnabled: config.TRADING_LOOP_ENABLED, phase: sessionPhase(new Date(), operational), time: `${localTime(new Date(), operational.timezone)} ${operational.timezone}`, sessionStartedAt: state?.started_at ?? null, sessionFinishedAt: state?.finished_at ?? null, decisionCyclesToday: Number(state?.decision_cycles ?? 0), operationalChecksToday: Number(state?.operational_checks ?? 0), forceCloseAttemptsToday: Number(state?.force_close_attempts ?? 0), dailyResultStatus, lastCycleAt: state?.last_cycle_at ?? null, nextCycleAt: state?.next_cycle_at ?? null, bank: account.cashUsdt, position, pnlToday: account.realizedPnlUsdt, aiCostToday: daily?.ai_cost_usd ?? 0, errorsToday: daily?.error_count ?? 0 };
+  const output = { loopEnabled: config.TRADING_LOOP_ENABLED, phase: sessionPhase(new Date(), operational), timezone: operational.timezone, time: `${localTime(new Date(), operational.timezone)} ${operational.timezone}`, sessionStartedAt: operatorTime(state?.started_at, operational.timezone), sessionFinishedAt: operatorTime(state?.finished_at, operational.timezone), decisionCyclesToday: Number(state?.decision_cycles ?? 0), operationalChecksToday: Number(state?.operational_checks ?? 0), forceCloseAttemptsToday: Number(state?.force_close_attempts ?? 0), dailyResultStatus, lastCycleAt: operatorTime(state?.last_cycle_at, operational.timezone), nextCycleAt: operatorTime(state?.next_cycle_at, operational.timezone), bank: account.cashUsdt, position, pnlToday: account.realizedPnlUsdt, aiCostToday: daily?.ai_cost_usd ?? 0, errorsToday: daily?.error_count ?? 0 };
   if (command === 'status') console.log(JSON.stringify(output, null, 2));
   else console.log(`Operação Bolinha de Gude\nLoop: ${output.loopEnabled ? 'ON' : 'OFF'}\nPhase: ${output.phase}\nTime: ${output.time}\nLast cycle: ${output.lastCycleAt ?? '—'}\nNext cycle: ${output.nextCycleAt ?? '—'}\nBank: ${output.bank.toFixed(2)} USDT\nPosition: ${output.position ? `BTC ${output.position.quantity}` : 'none'}\nP/L today: ${output.pnlToday.toFixed(2)}\nAI cost today: ${output.aiCostToday}\nErrors today: ${output.errorsToday}`);
 }

@@ -84,7 +84,7 @@ const configurationStateResponse = async () => {
   const configuration = await repo.configuration();
   const state = await repo.configurationEditability(new Date(), configuration);
   await repo.event('INFO', 'configuration_viewed', 'Operational configuration viewed', {
-    editable: state.editable, blockedReason: state.blockedReason, sessionPhase: state.sessionPhase,
+    editable: state.editable, reason: state.reason, sessionPhase: state.sessionPhase,
   });
   return { ...configurationResponse(configuration), currentConfiguration: configurationResponse(configuration), ...state, loopEnabled: config.TRADING_LOOP_ENABLED };
 };
@@ -96,11 +96,11 @@ app.get('/configuration/:id', async (request, reply) => {
 const saveConfiguration = async (body: unknown, eventName: 'configuration_updated' | 'configuration_created') => {
   const next = configurationInput(body);
   const configuration = await repo.updateConfiguration(next, new Date(), eventName);
-  return { ...configurationResponse(configuration), editable: true, blockedReason: null };
+  return { ...configurationResponse(configuration), editable: true, reason: null, message: null, blockedReason: null };
 };
 const sendConfigurationMutationError = (error: unknown, reply: { code: (statusCode: number) => { send: (payload: unknown) => unknown } }) => {
   if (error instanceof ConfigurationBlockedError)
-    return reply.code(409).send({ error: error.message, blockedReason: error.state.blockedReason, sessionPhase: error.state.sessionPhase });
+    return reply.code(409).send({ error: error.message, reason: error.state.reason, message: error.state.message, blockedReason: error.state.blockedReason, sessionPhase: error.state.sessionPhase });
   if (error instanceof Error) return reply.code(400).send({ error: error.message });
   return reply.code(400).send({ error: 'invalid configuration' });
 };
