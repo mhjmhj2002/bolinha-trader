@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "typecheck": "tsc -b",
-    "test": "vitest run",
+    "test": "TRADING_START_TIME=09:00 TRADING_STOP_NEW_POSITIONS_TIME=17:50 FORCE_CLOSE_TIME=17:55 TRADING_END_TIME=18:00 vitest run",
     "db:migrate": "tsx packages/database/src/migrate.ts",
     "trading:once": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:once",
     "trading:once:local": "pnpm --filter @bolinha/worker trading:once",
@@ -17,7 +17,8 @@
     "trading:force-close": "docker compose exec -T worker pnpm --filter @bolinha/worker force-close",
     "trading:status": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:status",
     "trading:day-test:check": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:day-test:check",
-    "trading:report:today": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:report:today"
+    "trading:report:today": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:report:today",
+    "trading:finalize:today": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:finalize:today"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1", "@types/node": "^24.10.1", "concurrently": "^9.2.1",

@@ -47,6 +47,16 @@ ALTER TABLE daily_results ADD COLUMN IF NOT EXISTS fees_by_asset jsonb;
 CREATE UNIQUE INDEX IF NOT EXISTS daily_results_session_day_unique ON daily_results(session_day) WHERE session_day IS NOT NULL;
 CREATE TABLE IF NOT EXISTS trading_sessions (session_day date PRIMARY KEY, timezone varchar(64) NOT NULL, phase varchar(32) NOT NULL, started_at timestamptz, finished_at timestamptz, last_cycle_at timestamptz, next_cycle_at timestamptz, cycles_today integer NOT NULL DEFAULT 0, updated_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS initial_equity_usdt numeric(20,8);
+-- These counters deliberately distinguish an AI/risk decision from a worker
+-- wake-up, reconciliation, or close-only retry.  ALTERs keep first-test
+-- evidence intact when this migration is re-applied.
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS decision_cycles integer NOT NULL DEFAULT 0;
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS operational_checks integer NOT NULL DEFAULT 0;
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS force_close_attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS reconciliation_runs integer NOT NULL DEFAULT 0;
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS consolidation_status varchar(16) NOT NULL DEFAULT 'PENDING';
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS consolidation_error text;
+ALTER TABLE trading_sessions ADD COLUMN IF NOT EXISTS consolidation_attempts integer NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS system_events (id serial PRIMARY KEY, level varchar(10) NOT NULL, event varchar(100) NOT NULL, message text NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS worker_heartbeats (id serial PRIMARY KEY, worker_id varchar(100) NOT NULL, status varchar(10) NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS reconciliation_state (id boolean PRIMARY KEY DEFAULT true CHECK (id), status varchar(10) NOT NULL DEFAULT 'ERROR', state_consistent boolean NOT NULL DEFAULT false, last_reconciled_at timestamptz, last_error text, updated_at timestamptz NOT NULL DEFAULT now());

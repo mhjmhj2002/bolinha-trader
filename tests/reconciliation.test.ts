@@ -65,4 +65,22 @@ describe('startup reconciliation after a process crash', () => {
     expect(fixture.values()).toMatchObject({ position: null, cash: 20, trades: 1, recordCalls: 1 });
     expect(fixture.values().events).toContain('position_closed');
   });
+
+  it('can reconcile after more than three transient Binance failures, without a restart', async () => {
+    const fixture = crashedExecutionFixture({ id: 3, clientOrderId: 'retry-after-outage', side: 'BUY', requestedQuantity: 0.001 });
+    let available = false;
+    fixture.exchange.orderByClientId = async (clientOrderId: string) => {
+      if (!available) throw new Error('Binance temporarily unavailable');
+      return { orderId: `binance-${clientOrderId}`, clientOrderId, status: 'FILLED', side: 'BUY', executedQty: 0.001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() };
+    };
+    const service = new TradingService(fixture.repo as never, fixture.exchange as never, {} as never);
+
+    await expect(service.reconcileStateOnStartup()).rejects.toThrow('Binance unavailable');
+    await expect(service.reconcileStateOnStartup()).rejects.toThrow('Binance unavailable');
+    await expect(service.reconcileStateOnStartup()).rejects.toThrow('Binance unavailable');
+    available = true;
+    await expect(service.reconcileStateOnStartup()).resolves.toMatchObject({ status: 'OK' });
+
+    expect(fixture.values()).toMatchObject({ cash: 10, trades: 1, recordCalls: 1 });
+  });
 });

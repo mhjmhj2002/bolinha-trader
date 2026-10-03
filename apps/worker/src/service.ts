@@ -119,6 +119,8 @@ export class TradingService {
       return { status: 'OK' as const, pendingOrders: 0 };
 
     await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+    const metricsRepo = this.repo as TradingRepository & { recordReconciliationRun?: () => Promise<void> };
+    await metricsRepo.recordReconciliationRun?.();
     await reconciliationRepo.reconciliationStarted();
     try {
       await this.event('INFO', 'reconciliation_started', 'Startup reconciliation started');
@@ -311,6 +313,17 @@ export class TradingService {
           requestedAction: response.decision.action,
         });
       }
+      // The cycle may have started seconds before the cutoff and spent enough
+      // time fetching market data or asking the model to cross it. Re-read the
+      // clock immediately before the order path; the phase captured above is
+      // intentionally not trusted for a new position.
+      if (risk.action === 'BUY' && sessionPhase(new Date()) !== 'TRADING') {
+        risk = { action: 'HOLD', amountUsdt: 0, quantity: 0, rejectionReason: 'New positions are blocked for today' };
+        await this.event('WARN', 'new_positions_blocked', 'BUY blocked after revalidating the cutoff before submission', {
+          phaseAtSubmission: sessionPhase(new Date()),
+          requestedAction: response.decision.action,
+        });
+      }
       await this.repo.saveDecision(
         response.decision,
         response.usage,
@@ -367,15 +380,20 @@ export class TradingService {
       await this.event('WARN', 'force_close_blocked', 'Forced close blocked pending reconciliation', { reason: ready.reason });
       return { action: 'HOLD' as const, reason: ready.reason };
     }
-    await this.event('WARN', 'force_close_started', 'Forced close requested', { symbol: config.SYMBOL });
     try {
     const position = await this.repo.openPosition();
     if (!position) {
-      await this.event('INFO', 'force_close_completed', 'No conceptual position to close', {
-        action: 'HOLD',
-      });
+      const onceRepo = this.repo as TradingRepository & {
+        eventOnceForSession?: (level: string, event: string, message: string, at?: Date, payload?: unknown) => Promise<boolean>;
+      };
+      if (onceRepo.eventOnceForSession)
+        await onceRepo.eventOnceForSession('INFO', 'force_close_noop', 'No conceptual position to close', new Date(), { action: 'HOLD' });
+      else await this.event('INFO', 'force_close_noop', 'No conceptual position to close', { action: 'HOLD' });
       return { action: 'HOLD', reason: 'No open conceptual position' };
     }
+    const metricsRepo = this.repo as TradingRepository & { recordForceCloseAttempt?: () => Promise<void> };
+    await metricsRepo.recordForceCloseAttempt?.();
+    await this.event('WARN', 'force_close_started', 'Forced close requested for an open conceptual position', { symbol: config.SYMBOL });
     const [account, rules, price] = await Promise.all([
       this.repo.account(),
       this.exchange.rules(),

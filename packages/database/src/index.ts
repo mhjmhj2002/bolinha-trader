@@ -9,6 +9,8 @@ export const pool = new pg.Pool({ connectionString: config.DATABASE_URL, max: 5 
 export const db = drizzle(pool); // Drizzle is the ORM boundary; explicit SQL below keeps ledger transactions auditable.
 type Row = Record<string, unknown>;
 const num = (value: unknown) => Number(value);
+/** Never pass JS arrays/objects directly to pg for a jsonb parameter. */
+export const serializeJsonb = (value: unknown) => JSON.stringify(value);
 export type PendingOrder = {
   id: number;
   clientOrderId: string;
@@ -135,28 +137,79 @@ export class TradingRepository {
     const previous = existing.rows[0]?.phase as SessionPhase | undefined;
     await this.client.query(
       `insert into trading_sessions(session_day,timezone,phase,started_at,finished_at,next_cycle_at,initial_equity_usdt,updated_at)
-       values($1,$2,$3,case when $3='TRADING' then $4 else null end,case when $3='FINISHED' then $4 else null end,$5,(select cash_usdt from trading_account order by id limit 1),$4)
+       values($1::date,$2::varchar(64),$3::varchar(32),
+         case when $3::varchar(32)='TRADING'::varchar(32) then $4::timestamptz else null::timestamptz end,
+         case when $3::varchar(32)='FINISHED'::varchar(32) then $4::timestamptz else null::timestamptz end,
+         $5::timestamptz,(select cash_usdt from trading_account order by id limit 1),$4::timestamptz)
        on conflict(session_day) do update set phase=excluded.phase, next_cycle_at=excluded.next_cycle_at,
-         started_at=coalesce(trading_sessions.started_at, case when excluded.phase='TRADING' then excluded.updated_at else null end),
-         finished_at=case when excluded.phase='FINISHED' then coalesce(trading_sessions.finished_at,excluded.updated_at) else trading_sessions.finished_at end,
+         started_at=coalesce(trading_sessions.started_at, case when excluded.phase='TRADING'::varchar(32) then excluded.updated_at else null::timestamptz end),
+         finished_at=case when excluded.phase='FINISHED'::varchar(32) then coalesce(trading_sessions.finished_at,excluded.updated_at) else trading_sessions.finished_at end,
          updated_at=excluded.updated_at`,
       [day, config.TRADING_TIMEZONE, phase, at, nextCycleAt],
     );
     return { day, changed: previous !== phase, previous };
   }
-  async completeCycle(at = new Date()) {
-    await this.client.query('update trading_sessions set last_cycle_at=$2,cycles_today=cycles_today+1,updated_at=$2 where session_day=$1', [sessionDay(at), at]);
+  /** @deprecated Kept for callers outside this repository; a cycle here means a decision cycle. */
+  async completeCycle(at = new Date()) { return this.completeDecisionCycle(at); }
+  async completeDecisionCycle(at = new Date()) {
+    await this.client.query(
+      'update trading_sessions set last_cycle_at=$2,cycles_today=cycles_today+1,decision_cycles=decision_cycles+1,updated_at=$2 where session_day=$1',
+      [sessionDay(at), at],
+    );
+  }
+  async recordOperationalCheck(at = new Date()) {
+    await this.client.query(
+      'update trading_sessions set operational_checks=operational_checks+1,updated_at=$2 where session_day=$1',
+      [sessionDay(at), at],
+    );
+  }
+  async recordForceCloseAttempt(at = new Date()) {
+    await this.client.query(
+      'update trading_sessions set force_close_attempts=force_close_attempts+1,updated_at=$2 where session_day=$1',
+      [sessionDay(at), at],
+    );
+  }
+  async recordReconciliationRun(at = new Date()) {
+    await this.client.query(
+      'update trading_sessions set reconciliation_runs=reconciliation_runs+1,updated_at=$2 where session_day=$1',
+      [sessionDay(at), at],
+    );
   }
   async session(at = new Date()) {
     return (await this.client.query('select * from trading_sessions where session_day=$1', [sessionDay(at)])).rows[0] ?? null;
   }
+  /** Recovery path for a stopped worker: record the configured end, never "now". */
+  async markSessionFinishedAtScheduledEnd(at = new Date()) {
+    const day = sessionDay(at);
+    const schedule = sessionSchedule();
+    await this.client.query(
+      `update trading_sessions set phase='FINISHED',finished_at=coalesce(finished_at, (($1::date + $2::time) at time zone $3)),
+       next_cycle_at=null,updated_at=$4 where session_day=$1 and phase <> 'FINISHED'`,
+      [day, schedule.end, config.TRADING_TIMEZONE, at],
+    );
+    return this.session(at);
+  }
   async event(level: string, event: string, message: string, payload?: unknown) {
-    await this.client.query('insert into system_events(level,event,message,payload) values($1,$2,$3,$4)', [
+    await this.client.query('insert into system_events(level,event,message,payload) values($1,$2,$3,$4::jsonb)', [
       level,
       event,
       message,
-      payload ?? null,
+      payload === undefined ? null : serializeJsonb(payload),
     ]);
+  }
+  /** Emits a phase-level marker once for a session, preventing retry noise. */
+  async eventOnceForSession(level: string, event: string, message: string, at = new Date(), payload?: unknown) {
+    const day = sessionDay(at);
+    const { rows } = await this.client.query<{ inserted: boolean }>(
+      `insert into system_events(level,event,message,payload,created_at)
+       select $1,$2::varchar(100),$3,$4::jsonb,$5
+       where not exists (
+         select 1 from system_events e join trading_sessions s on s.session_day=$6::date
+         where e.event=$2::varchar(100) and e.created_at >= s.started_at and e.created_at <= coalesce(s.finished_at,$5)
+       ) returning true as inserted`,
+      [level, event, message, payload === undefined ? null : serializeJsonb(payload), at, day],
+    );
+    return Boolean(rows[0]?.inserted);
   }
   async saveSnapshot(snapshot: MarketSnapshot): Promise<number> {
     const { rows } = await this.client.query<{ id: number }>(
@@ -380,40 +433,98 @@ export class TradingRepository {
   async dailyResult(day = sessionDay()) {
     return (await this.client.query('select * from daily_results where session_day=$1', [day])).rows[0] ?? null;
   }
+  async dailyResultStatus(day = sessionDay()): Promise<'PENDING' | 'OK' | 'ERROR' | null> {
+    if (await this.dailyResult(day)) return 'OK';
+    const session = await this.sessionForDay(day);
+    return session ? String(session.consolidation_status ?? 'PENDING') as 'PENDING' | 'OK' | 'ERROR' : null;
+  }
+  private async sessionForDay(day: string) {
+    return (await this.client.query<Row>('select * from trading_sessions where session_day=$1', [day])).rows[0] ?? null;
+  }
+  async markDailyResultPending(at = new Date()) {
+    await this.client.query(
+      `update trading_sessions set consolidation_status='PENDING',consolidation_error=null,
+       consolidation_attempts=consolidation_attempts+1,updated_at=$2 where session_day=$1`,
+      [sessionDay(at), at],
+    );
+  }
+  async markDailyResultFailed(error: string, at = new Date()) {
+    await this.client.query(
+      `update trading_sessions set consolidation_status='ERROR',consolidation_error=$2,
+       consolidation_attempts=consolidation_attempts+1,updated_at=$3 where session_day=$1`,
+      [sessionDay(at), error, at],
+    );
+  }
+  async markDailyResultOk(at = new Date()) {
+    await this.client.query(
+      "update trading_sessions set consolidation_status='OK',consolidation_error=null,updated_at=$2 where session_day=$1",
+      [sessionDay(at), at],
+    );
+  }
   async createDailyResult(price: number, at = new Date()) {
     const day = sessionDay(at);
+    const session = await this.sessionForDay(day);
+    if (!session || String(session.phase) !== 'FINISHED')
+      throw new Error('Daily result can only be consolidated after the session is FINISHED');
+    if (await this.openPosition())
+      throw new Error('Daily result cannot be consolidated while a conceptual position is open');
+    const schedule = sessionSchedule();
+    const finishedAt = session.finished_at
+      ? new Date(String(session.finished_at))
+      : (await this.client.query<{ at: Date }>(
+        "select (($1::date + $2::time) at time zone $3) as at",
+        [day, schedule.end, config.TRADING_TIMEZONE],
+      )).rows[0].at;
+    const startedAt = session.started_at ? new Date(String(session.started_at)) : finishedAt;
     const performance = await this.performance(price);
-    const session = await this.session(at);
     const initialEquityUsdt = session?.initial_equity_usdt === null || session?.initial_equity_usdt === undefined
       ? performance.initialBankUsdt
       : num(session.initial_equity_usdt);
-    const dailyFees = await this.feeSummary(day);
+    const dailyFees = await this.feeSummaryForSession(startedAt, finishedAt);
     const { rows } = await this.client.query<Row>(
       `select
        count(*) filter (where t.side='BUY')::int as buy_count, count(*) filter (where t.side='SELL')::int as sell_count,
        count(*)::int as trade_count,
-       (select count(*)::int from ai_decisions d where to_char(d.timestamp at time zone $2,'YYYY-MM-DD')=$1 and d.action_after_risk='HOLD') as hold_count,
-       (select count(*)::int from ai_decisions d where to_char(d.timestamp at time zone $2,'YYYY-MM-DD')=$1 and d.rejection_reason is not null) as rejected_count,
-       (select count(*)::int from ai_usage u where to_char(u.created_at at time zone $2,'YYYY-MM-DD')=$1) as ai_calls,
-       (select coalesce(sum(u.cost_usd),0) from ai_usage u where to_char(u.created_at at time zone $2,'YYYY-MM-DD')=$1) as ai_cost,
-       (select coalesce(jsonb_agg(distinct u.model) filter (where u.model is not null),'[]'::jsonb) from ai_usage u where to_char(u.created_at at time zone $2,'YYYY-MM-DD')=$1) as models,
-       (select count(*)::int from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='ai_fallback') as fallback_count,
-       (select count(*)::int from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.level='ERROR') as error_count,
-       (select exists(select 1 from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='force_close_started')) as forced_close,
-       (select min(created_at) from system_events e where to_char(e.created_at at time zone $2,'YYYY-MM-DD')=$1 and e.event='trading_session_started') as started_at,
+       (select count(*)::int from ai_decisions d where d.timestamp >= $1 and d.timestamp <= $2 and d.action_after_risk='HOLD') as hold_count,
+       (select count(*)::int from ai_decisions d where d.timestamp >= $1 and d.timestamp <= $2 and d.action_requested <> d.action_after_risk) as rejected_count,
+       (select count(*)::int from ai_usage u join ai_decisions d on d.id=u.decision_id where d.timestamp >= $1 and d.timestamp <= $2) as ai_calls,
+       (select coalesce(sum(u.cost_usd),0) from ai_usage u join ai_decisions d on d.id=u.decision_id where d.timestamp >= $1 and d.timestamp <= $2) as ai_cost,
+       (select coalesce(jsonb_agg(distinct u.model) filter (where u.model is not null),'[]'::jsonb) from ai_usage u join ai_decisions d on d.id=u.decision_id where d.timestamp >= $1 and d.timestamp <= $2) as models,
+       (select count(*)::int from system_events e where e.created_at >= $1 and e.created_at <= $2 and e.event='ai_fallback') as fallback_count,
+       (select count(*)::int from system_events e where e.created_at >= $1 and e.created_at <= $2 and e.level='ERROR') as error_count,
+       (select exists(select 1 from system_events e where e.created_at >= $1 and e.created_at <= $2 and e.event='force_close_completed' and e.payload ? 'orderId')) as forced_close,
        coalesce(sum(t.gross_pnl_usdt) filter (where t.side='SELL'),0) as gross_pnl,
        coalesce(sum(t.net_pnl_usdt) filter (where t.side='SELL'),0) as net_pnl
-       from trades t where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1`,
-      [day, config.TRADING_TIMEZONE],
+       from trades t where t.executed_at >= $1 and t.executed_at <= $2`,
+      [startedAt, finishedAt],
     );
     const metrics = rows[0];
     await this.client.query(
       `insert into daily_results(day,session_day,timezone,equity_usdt,initial_equity_usdt,final_equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,fees_by_asset,gross_return_pct,trade_count,buy_count,sell_count,hold_count,rejected_decision_count,ai_call_count,ai_cost_usd,models_used,fallback_count,error_count,forced_close_occurred,started_at,finished_at)
-       values($1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+       values($1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25)
        on conflict(session_day) where session_day is not null do update set final_equity_usdt=excluded.final_equity_usdt,equity_usdt=excluded.equity_usdt,realized_pnl_usdt=excluded.realized_pnl_usdt,unrealized_pnl_usdt=excluded.unrealized_pnl_usdt,gross_pnl_usdt=excluded.gross_pnl_usdt,fees_usdt_known=excluded.fees_usdt_known,net_pnl_usdt=excluded.net_pnl_usdt,fees_by_asset=excluded.fees_by_asset,gross_return_pct=excluded.gross_return_pct,trade_count=excluded.trade_count,buy_count=excluded.buy_count,sell_count=excluded.sell_count,hold_count=excluded.hold_count,rejected_decision_count=excluded.rejected_decision_count,ai_call_count=excluded.ai_call_count,ai_cost_usd=excluded.ai_cost_usd,models_used=excluded.models_used,fallback_count=excluded.fallback_count,error_count=excluded.error_count,forced_close_occurred=excluded.forced_close_occurred,finished_at=excluded.finished_at`,
-      [at, day, config.TRADING_TIMEZONE, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, num(metrics.gross_pnl), dailyFees.feesUsdtKnown, num(metrics.net_pnl), dailyFees.feesByAsset, ((performance.equityUsdt-initialEquityUsdt)/initialEquityUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, metrics.models, metrics.fallback_count, metrics.error_count, metrics.forced_close, metrics.started_at, at],
+      [at, day, config.TRADING_TIMEZONE, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, num(metrics.gross_pnl), dailyFees.feesUsdtKnown, num(metrics.net_pnl), serializeJsonb(dailyFees.feesByAsset), ((performance.equityUsdt-initialEquityUsdt)/initialEquityUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, serializeJsonb(metrics.models ?? []), metrics.fallback_count, metrics.error_count, metrics.forced_close, startedAt, finishedAt],
     );
+    // Older sessions predate the explicit counter; the persisted decision
+    // evidence is authoritative when recovering their daily result.
+    await this.client.query(
+      'update trading_sessions set decision_cycles=greatest(decision_cycles,$2),updated_at=$3 where session_day=$1',
+      [day, num(metrics.ai_calls), at],
+    );
+    await this.markDailyResultOk(at);
     return this.dailyResult(day);
+  }
+  private async feeSummaryForSession(startedAt: Date, finishedAt: Date) {
+    const daily = await this.client.query<Row>(
+      `select tf.asset, coalesce(sum(tf.amount),0) as amount, coalesce(sum(tf.amount_usdt),0) as amount_usdt
+       from trade_fees tf join trades t on t.id=tf.trade_id
+       where t.executed_at >= $1 and t.executed_at <= $2 group by tf.asset`,
+      [startedAt, finishedAt],
+    );
+    const feesByAsset: Record<string, number> = {};
+    let feesUsdtKnown = 0;
+    for (const row of daily.rows) { feesByAsset[String(row.asset)] = num(row.amount); feesUsdtKnown += num(row.amount_usdt); }
+    return { feesByAsset, feesUsdtKnown };
   }
   private async feeSummary(day?: string) {
     const daily = day
@@ -440,7 +551,7 @@ export class TradingRepository {
   async dailyReport(day = sessionDay()): Promise<DailyReport> {
     if (!isSessionDay(day)) throw new Error('date must use the YYYY-MM-DD calendar format');
     const schedule = sessionSchedule();
-    const localDay = [day, config.TRADING_TIMEZONE];
+    const localDay = [day];
     const [sessionResult, dailyResult, accountResult, operationResult, aiResult, modelResult, eventResult, pendingResult, rejectedResult, positionResult] = await Promise.all([
       this.client.query<Row>('select * from trading_sessions where session_day=$1', [day]),
       this.client.query<Row>('select * from daily_results where session_day=$1', [day]),
@@ -450,35 +561,42 @@ export class TradingRepository {
            count(*) filter (where side='BUY')::int as buy_count,
            count(*) filter (where side='SELL')::int as sell_count,
            coalesce(sum(net_pnl_usdt) filter (where side='SELL'),0) as net_pnl,
-           (select count(*)::int from ai_decisions where to_char(timestamp at time zone $2,'YYYY-MM-DD')=$1 and action_after_risk='HOLD') as hold_count,
-           (select count(*)::int from ai_decisions where to_char(timestamp at time zone $2,'YYYY-MM-DD')=$1 and rejection_reason is not null) as rejected_count
-         from trades where to_char(executed_at at time zone $2,'YYYY-MM-DD')=$1`,
+           (select count(*)::int from ai_decisions d join trading_sessions s on s.session_day=$1::date where d.timestamp >= s.started_at and d.timestamp <= coalesce(s.finished_at,now()) and d.action_after_risk='HOLD') as hold_count,
+           (select count(*)::int from ai_decisions d join trading_sessions s on s.session_day=$1::date where d.timestamp >= s.started_at and d.timestamp <= coalesce(s.finished_at,now()) and d.action_requested <> d.action_after_risk) as rejected_count,
+           (select count(*)::int from ai_decisions d join trading_sessions s on s.session_day=$1::date where d.timestamp >= s.started_at and d.timestamp <= coalesce(s.finished_at,now())) as decision_count
+         from trades t join trading_sessions s on s.session_day=$1::date
+         where t.executed_at >= s.started_at and t.executed_at <= coalesce(s.finished_at,now())`,
         localDay,
       ),
       this.client.query<Row>(
         `select count(*)::int as calls, coalesce(sum(cost_usd),0) as cost_usd
-         from ai_usage where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1`,
+         from ai_usage u join ai_decisions d on d.id=u.decision_id join trading_sessions s on s.session_day=$1::date
+         where d.timestamp >= s.started_at and d.timestamp <= coalesce(s.finished_at,now())`,
         localDay,
       ),
       this.client.query<Row>(
         `select model, count(*)::int as calls from ai_usage
-         where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1
+         join ai_decisions d on d.id=ai_usage.decision_id join trading_sessions s on s.session_day=$1::date
+         where d.timestamp >= s.started_at and d.timestamp <= coalesce(s.finished_at,now())
          group by model order by model`,
         localDay,
       ),
       this.client.query<Row>(
         `select level,event,message,payload,created_at from system_events
-         where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at`,
+         where created_at >= (select started_at from trading_sessions where session_day=$1::date)
+           and created_at <= coalesce((select finished_at from trading_sessions where session_day=$1::date),now()) order by created_at`,
         localDay,
       ),
       this.client.query<Row>(
         `select count(*)::int as count from orders
-         where status='PENDING' and to_char(created_at at time zone $2,'YYYY-MM-DD')=$1`,
+         where status='PENDING' and created_at >= (select started_at from trading_sessions where session_day=$1::date)
+           and created_at <= coalesce((select finished_at from trading_sessions where session_day=$1::date),now())`,
         localDay,
       ),
       this.client.query<Row>(
         `select count(*)::int as count from orders
-         where status='REJECTED' and to_char(created_at at time zone $2,'YYYY-MM-DD')=$1`,
+         where status='REJECTED' and created_at >= (select started_at from trading_sessions where session_day=$1::date)
+           and created_at <= coalesce((select finished_at from trading_sessions where session_day=$1::date),now())`,
         localDay,
       ),
       this.client.query<Row>(
@@ -534,17 +652,28 @@ export class TradingRepository {
         phase: String(sessionRow.phase),
         startedAt: sessionRow.started_at ? new Date(String(sessionRow.started_at)).toISOString() : null,
         finishedAt: sessionRow.finished_at ? new Date(String(sessionRow.finished_at)).toISOString() : null,
-        cyclesExecuted: num(sessionRow.cycles_today),
+        cyclesExecuted: num(operations.decision_count ?? 0),
+        decisionCycles: num(operations.decision_count ?? 0),
+        operationalChecks: Math.max(num(sessionRow.operational_checks ?? 0), num(sessionRow.cycles_today ?? 0) - num(operations.decision_count ?? 0)),
+        forceCloseAttempts: num(sessionRow.force_close_attempts ?? 0),
+        reconciliationRuns: num(sessionRow.reconciliation_runs ?? 0),
       } : null,
       bank: { initialUsdt, finalUsdt, netPnlUsdt },
       operations: {
         buy: num(operations.buy_count), sell: num(operations.sell_count), hold: num(operations.hold_count),
-        rejectedByRisk: num(operations.rejected_count), forceClose: eventCount('force_close_started') > 0,
+        rejectedByRisk: num(operations.rejected_count), forceClose: events.some((row) => {
+          if (String(row.event) !== 'force_close_completed') return false;
+          const payload = row.payload;
+          return Boolean(payload && typeof payload === 'object' && !Array.isArray(payload) && typeof (payload as Record<string, unknown>).orderId === 'string');
+        }),
       },
       ai: { calls: num(usage.calls), costUsd: num(usage.cost_usd), fallbacks: eventCount('ai_fallback'), models },
       infrastructure: {
         cyclesExpected: expectedCycles,
-        cyclesExecuted: sessionRow ? num(sessionRow.cycles_today) : 0,
+        cyclesExecuted: num(operations.decision_count ?? 0),
+        operationalChecks: Math.max(num(sessionRow?.operational_checks ?? 0), num(sessionRow?.cycles_today ?? 0) - num(operations.decision_count ?? 0)),
+        forceCloseAttempts: num(sessionRow?.force_close_attempts ?? 0),
+        reconciliationRuns: num(sessionRow?.reconciliation_runs ?? 0),
         maxCycleGapSeconds,
         workerRestarts: Math.max(0, eventCount('worker_started') - 1),
         errors: events.filter((row) => String(row.level) === 'ERROR').length,
@@ -556,6 +685,7 @@ export class TradingRepository {
         rejectedOrders: num(rejectedResult.rows[0].count),
       },
       finalState: { openPosition: Boolean(positionResult.rows[0].open_after_end) },
+      consolidationStatus: dailyRow ? 'OK' : sessionRow ? String(sessionRow.consolidation_status ?? 'PENDING') as 'PENDING' | 'OK' | 'ERROR' : null,
     };
     return buildDailyReport(reportInput);
   }
@@ -615,7 +745,7 @@ export class TradingRepository {
     for (const decision of decisions) {
       const action = String(decision.actionAfterRisk) as 'BUY' | 'SELL' | 'HOLD';
       if (action in decisionCounts) decisionCounts[action]++;
-      if (decision.rejectionReason) decisionCounts.rejectedByRisk++;
+      if (decision.actionRequested !== decision.actionAfterRisk) decisionCounts.rejectedByRisk++;
     }
     const models = usageResult.rows.map((row) => ({ model: String(row.model), calls: num(row.calls), promptTokens: num(row.prompt_tokens), completionTokens: num(row.completion_tokens), totalTokens: num(row.total_tokens), costUsd: num(row.cost_usd) }));
     const fallbackCount = eventsResult.rows.filter((row) => String(row.event) === 'ai_fallback').length;

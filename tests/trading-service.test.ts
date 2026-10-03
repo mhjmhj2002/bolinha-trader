@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TradingService } from '../apps/worker/src/service.ts';
 import type { Candle } from '@bolinha/market-data';
 
 const candles = Array.from({ length: 30 }, (_, i): Candle => ({ openTime: i, closeTime: i, open: 100 + i, high: 101 + i, low: 99 + i, close: 100 + i, volume: 10 }));
+afterEach(() => vi.useRealTimers());
 describe('one trading cycle', () => {
   it('persists a mocked HOLD and its operational events without submitting an order', async () => {
     const saved: { snapshot: boolean; decision: boolean; events: string[] } = { snapshot: false, decision: false, events: [] };
@@ -62,5 +63,28 @@ describe('one trading cycle', () => {
     await new TradingService(repo as never, exchange as never, {} as never).runOnce(new Date('2026-10-01T21:10:00Z'));
     expect(submitted).toBe(1);
     expect(position).toBeNull();
+  });
+
+  it('turns a BUY into HOLD when analysis crosses the 17:50 cutoff before submission', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-01T20:50:01Z'));
+    let submitted = 0;
+    const savedActions: string[] = [];
+    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => null, pendingOrder: async () => false, saveSnapshot: async () => 1, saveDecision: async (_decision: unknown, _usage: unknown, action: string) => { savedActions.push(action); return 1; }, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => {} };
+    const exchange = { candles: async () => candles.map((c) => ({ ...c, open: 10_000, high: 10_001, low: 9_999, close: 10_000 })), rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), placeMarketOrder: async () => { submitted++; throw new Error('must not submit after cutoff'); }, orderByClientId: async () => null };
+    const ai = { decide: async () => ({ decision: { action: 'BUY' as const, amountUsdt: 10, confidence: 1, reason: 'buy', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
+
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T20:49:59Z'));
+    expect(result.action).toBe('HOLD');
+    expect(savedActions).toEqual(['HOLD']);
+    expect(submitted).toBe(0);
+  });
+
+  it('records a force-close without a position as a NOOP, not as a forced close', async () => {
+    const events: string[] = [];
+    const repo = { ensureAccount: async () => {}, event: async (_severity: string, type: string) => { events.push(type); }, openPosition: async () => null, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false };
+    const result = await new TradingService(repo as never, {} as never, {} as never).forceClosePosition();
+    expect(result).toMatchObject({ action: 'HOLD', reason: 'No open conceptual position' });
+    expect(events).toEqual(['force_close_noop']);
   });
 });

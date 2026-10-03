@@ -51,7 +51,9 @@ export const localTime = (at = new Date(), timezone: string = config.TRADING_TIM
  */
 export const sessionPhase = (at = new Date(), schedule = sessionSchedule(), hasOpenPosition = false): SessionPhase => {
   const time = localTime(at, schedule.timezone).slice(0, 5);
-  if (time < schedule.start) return 'BEFORE_START';
+  // A conceptual position is never allowed to wait for the next session. This
+  // includes the overnight period before the normal start time.
+  if (time < schedule.start) return hasOpenPosition ? 'FORCE_CLOSE_PENDING' : 'BEFORE_START';
   if (time < schedule.stopNewPositions) return 'TRADING';
   if (time < schedule.forceClose) return 'NO_NEW_POSITIONS';
   if (time < schedule.end) return 'FORCE_CLOSE';
@@ -73,7 +75,8 @@ export type DailyDiagnosticCode =
   | 'PENDING_ORDER'
   | 'RECONCILIATION_ISSUE'
   | 'PNL_DIVERGENT'
-  | 'SESSION_INCOMPLETE';
+  | 'SESSION_INCOMPLETE'
+  | 'CONSOLIDATION_PENDING';
 
 export type DailyDiagnostic = {
   code: DailyDiagnosticCode;
@@ -90,6 +93,10 @@ export type DailyReportInput = {
     startedAt: string | null;
     finishedAt: string | null;
     cyclesExecuted: number;
+    decisionCycles?: number;
+    operationalChecks?: number;
+    forceCloseAttempts?: number;
+    reconciliationRuns?: number;
   } | null;
   bank: {
     initialUsdt: number | null;
@@ -98,6 +105,7 @@ export type DailyReportInput = {
   };
   operations: { buy: number; sell: number; hold: number; rejectedByRisk: number; forceClose: boolean };
   ai: { calls: number; costUsd: number; fallbacks: number; models: Record<string, number> };
+  consolidationStatus?: 'PENDING' | 'OK' | 'ERROR' | null;
   infrastructure: {
     cyclesExpected: number;
     cyclesExecuted: number;
@@ -110,6 +118,9 @@ export type DailyReportInput = {
     reconciliationIssues: number;
     pendingOrders: number;
     rejectedOrders: number;
+    operationalChecks?: number;
+    forceCloseAttempts?: number;
+    reconciliationRuns?: number;
   };
   finalState: { openPosition: boolean };
 };
@@ -136,7 +147,7 @@ const reportDiagnostic = (
  */
 export const buildDailyReport = (input: DailyReportInput): DailyReport => {
   const diagnostics: DailyDiagnostic[] = [];
-  const sessionFinished = input.session?.phase === 'FINISHED' && Boolean(input.session.finishedAt) && input.bank.finalUsdt !== null;
+  const sessionFinished = input.session?.phase === 'FINISHED' && Boolean(input.session.finishedAt) && input.bank.finalUsdt !== null && (input.consolidationStatus ?? 'OK') === 'OK';
   const status = sessionFinished && !input.finalState.openPosition
     ? 'CONCLUÍDA'
     : input.session?.phase === 'FINISHED' ? 'INCOMPLETA' : input.session ? 'EM ANDAMENTO' : 'INCOMPLETA';
@@ -148,6 +159,8 @@ export const buildDailyReport = (input: DailyReportInput): DailyReport => {
   ) * 60));
 
   if (!sessionFinished) reportDiagnostic(diagnostics, 'SESSION_INCOMPLETE', 'WARN', 'A sessão não foi concluída.');
+  if (input.session?.phase === 'FINISHED' && input.consolidationStatus && input.consolidationStatus !== 'OK')
+    reportDiagnostic(diagnostics, 'CONSOLIDATION_PENDING', input.consolidationStatus === 'ERROR' ? 'ERROR' : 'WARN', `Consolidação diária: ${input.consolidationStatus}.`);
   if (input.session && infrastructure.cyclesExecuted < infrastructure.cyclesExpected)
     reportDiagnostic(diagnostics, 'CYCLE_MISSED', 'WARN', `${infrastructure.cyclesExpected - infrastructure.cyclesExecuted} ciclo(s) esperado(s) não foram executados.`, infrastructure.cyclesExpected - infrastructure.cyclesExecuted);
   if (infrastructure.maxCycleGapSeconds !== null && infrastructure.maxCycleGapSeconds > intervalSeconds * 1.5)
@@ -157,7 +170,7 @@ export const buildDailyReport = (input: DailyReportInput): DailyReport => {
   if (infrastructure.binanceErrors > 0)
     reportDiagnostic(diagnostics, 'BINANCE_ERROR', 'ERROR', `${infrastructure.binanceErrors} erro(s) da Binance.`, infrastructure.binanceErrors);
   if (infrastructure.openRouterErrors > 0)
-    reportDiagnostic(diagnostics, 'OPENROUTER_ERROR', 'ERROR', `${infrastructure.openRouterErrors} erro(s) do OpenRouter.`, infrastructure.openRouterErrors);
+    reportDiagnostic(diagnostics, 'OPENROUTER_ERROR', 'WARN', `${infrastructure.openRouterErrors} erro(s) do OpenRouter com HOLD seguro.`, infrastructure.openRouterErrors);
   if (input.ai.fallbacks > 0)
     reportDiagnostic(diagnostics, 'FALLBACK', 'WARN', `${input.ai.fallbacks} fallback(s) de IA utilizado(s).`, input.ai.fallbacks);
   const rejectedOrders = input.operations.rejectedByRisk + infrastructure.rejectedOrders;
@@ -229,13 +242,17 @@ export const formatDailyReport = (report: DailyReport): string => {
     '',
     'Infraestrutura',
     `Ciclos esperados: ${report.infrastructure.cyclesExpected}`,
-    `Ciclos executados: ${report.infrastructure.cyclesExecuted}`,
+    `Decision cycles executados: ${report.infrastructure.cyclesExecuted}`,
+    `Operational checks: ${report.infrastructure.operationalChecks ?? 0}`,
+    `Force-close attempts: ${report.infrastructure.forceCloseAttempts ?? 0}`,
+    `Reconciliações: ${report.infrastructure.reconciliationRuns ?? 0}`,
     `Erros: ${report.infrastructure.errors}`,
     `Reinícios do worker: ${report.infrastructure.workerRestarts}`,
     `Maior intervalo sem ciclo: ${duration(report.infrastructure.maxCycleGapSeconds)}`,
     '',
     'Estado final',
     `Posição aberta: ${report.finalState.openPosition ? 'SIM' : 'NÃO'}`,
+    `Daily result: ${report.consolidationStatus ?? 'PENDING'}`,
     '',
     'Diagnósticos',
     ...diagnosticLines,

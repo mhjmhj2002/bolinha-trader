@@ -55,4 +55,20 @@ describe('daily operational report', () => {
     expect(report.status).toBe('EM ANDAMENTO');
     expect(report.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(expect.arrayContaining(['SESSION_INCOMPLETE', 'CYCLE_MISSED', 'CYCLE_DELAYED']));
   });
+
+  it('keeps a safe OpenRouter HOLD as attention, while unsafe state remains critical', () => {
+    const report = buildDailyReport(input({
+      infrastructure: { ...input().infrastructure, openRouterErrors: 1 },
+    }));
+    expect(report.operationalResult).toBe('ATENÇÃO');
+    expect(report.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'OPENROUTER_ERROR', severity: 'WARN' }),
+    ]));
+  });
+
+  it('does not report a FINISHED session as complete before daily consolidation', () => {
+    const report = buildDailyReport(input({ consolidationStatus: 'ERROR' }));
+    expect(report.status).toBe('INCOMPLETA');
+    expect(report.operationalResult).toBe('CRÍTICO');
+  });
 });

@@ -159,6 +159,18 @@ export class BinanceTestnetClient implements BinanceGateway {
       commissionAsset: String(f.commissionAsset ?? ''),
       tradeId: f.tradeId === undefined && f.id === undefined ? null : String(f.tradeId ?? f.id),
     }));
+    // Query Order responses do not contain transactTime.  Binance documents
+    // updateTime and time for that endpoint, so never turn an absent field
+    // into an Invalid Date and silently persist it in the ledger.
+    const timestamp = data.transactTime ?? data.updateTime ?? data.time;
+    const timestampMs = typeof timestamp === 'number'
+      ? timestamp
+      : typeof timestamp === 'string' && /^\d+$/.test(timestamp) ? Number(timestamp) : NaN;
+    if (!Number.isFinite(timestampMs) || timestampMs <= 0)
+      throw new Error('Binance order response does not contain a valid execution timestamp');
+    const transactTime = new Date(timestampMs);
+    if (Number.isNaN(transactTime.getTime()))
+      throw new Error('Binance order response produced an invalid execution timestamp');
     return {
       clientOrderId: data.clientOrderId,
       orderId: String(data.orderId),
@@ -168,7 +180,7 @@ export class BinanceTestnetClient implements BinanceGateway {
       cummulativeQuoteQty: +data.cummulativeQuoteQty,
       fills,
       commission: fills.reduce((sum, fill) => sum + fill.commission, 0),
-      transactTime: new Date(data.transactTime),
+      transactTime,
     };
   }
 }

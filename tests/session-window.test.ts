@@ -16,4 +16,15 @@ describe('São Paulo daily session window', () => {
     expect(sessionPhase(new Date('2026-10-01T21:00:00Z'), undefined, true)).toBe('FORCE_CLOSE_PENDING');
     expect(sessionPhase(new Date('2026-10-01T21:10:00Z'), undefined, true)).toBe('FORCE_CLOSE_PENDING');
   });
+
+  it.each([
+    ['02:00', '2026-10-01T05:00:00Z'],
+    ['08:45', '2026-10-01T11:45:00Z'],
+  ])('puts an overnight open position in FORCE_CLOSE_PENDING at %s', (_label, iso) => {
+    expect(sessionPhase(new Date(iso), undefined, true)).toBe('FORCE_CLOSE_PENDING');
+  });
+
+  it('allows BEFORE_START only when no conceptual position is open', () => {
+    expect(sessionPhase(new Date('2026-10-01T11:45:00Z'), undefined, false)).toBe('BEFORE_START');
+  });
 });

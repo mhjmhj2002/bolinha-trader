@@ -1,8 +1,9 @@
-import { config, localTime, logger, sessionPhase, type SessionPhase } from '@bolinha/core';
+import { config, logger, sessionPhase, type SessionPhase } from '@bolinha/core';
 import { TradingRepository } from '@bolinha/database';
 import { BinanceTestnetClient } from '@bolinha/exchange';
 import { TradingService } from './service.js';
-import { closeRetryDelayMs, finishDailyIfPositionClosed, isCloseOnlyPhase } from './lifecycle.js';
+import { finishDailyIfPositionClosed, isCloseOnlyPhase } from './lifecycle.js';
+import { nextCycleAt, reconciliationRetryDelay } from './scheduler.js';
 
 const repo = new TradingRepository();
 const service = new TradingService(repo);
@@ -11,22 +12,7 @@ let stopped = false;
 let timer: NodeJS.Timeout | undefined;
 let startupReconciled = false;
 let reconciliationAttempts = 0;
-const reconciliationRetryDelayMs = 30_000;
-const reconciliationMaxAttempts = 3;
-const secondsUntil = (target: string, at = new Date()) => {
-  const [h, m, s] = localTime(at).split(':').map(Number);
-  const current = h * 3600 + m * 60 + s;
-  const [targetHour, targetMinute] = target.split(':').map(Number);
-  let seconds = targetHour * 3600 + targetMinute * 60 - current;
-  if (seconds <= 0) seconds += 24 * 3600;
-  return seconds * 1000;
-};
-const nextDelay = (phase: SessionPhase, at = new Date()) => {
-  const interval = config.TRADING_INTERVAL_SECONDS * 1000;
-  if (phase === 'FORCE_CLOSE_PENDING') return closeRetryDelayMs;
-  const boundary = phase === 'BEFORE_START' ? config.TRADING_START_TIME : phase === 'TRADING' ? config.TRADING_STOP_NEW_POSITIONS_TIME : phase === 'NO_NEW_POSITIONS' ? config.FORCE_CLOSE_TIME : phase === 'FORCE_CLOSE' ? config.TRADING_END_TIME : config.TRADING_START_TIME;
-  return Math.max(250, Math.min(phase === 'FORCE_CLOSE' ? closeRetryDelayMs : interval, secondsUntil(boundary, at)));
-};
+let ticking = false;
 async function transition(phase: SessionPhase, next: Date, at: Date) {
   const state = await repo.updateSession(phase, next, at);
   if (!state.changed) return;
@@ -35,50 +21,58 @@ async function transition(phase: SessionPhase, next: Date, at: Date) {
   if (phase === 'FINISHED') await repo.event('INFO', 'trading_session_finished', 'Trading session finished', { sessionDay: state.day });
 }
 async function tick() {
-  if (stopped) return;
+  if (stopped || ticking) return;
+  ticking = true;
   const at = new Date();
   let phase: SessionPhase | undefined;
+  let consolidationRetry = false;
   try {
     await repo.ensureAccount(config.INITIAL_BANK_USDT); await repo.heartbeat();
     if (!startupReconciled) {
-      if (reconciliationAttempts < reconciliationMaxAttempts) {
+      try {
         reconciliationAttempts++;
         await service.reconcileStateOnStartup();
         startupReconciled = true;
-      } else {
-        // Keep the process observable after bounded retries, but never allow a
-        // trading cycle until a restart obtains a clean reconciliation.
-        return;
+        reconciliationAttempts = 0;
+      } catch (error) {
+        // Keep retrying with a capped backoff. Trading remains fail-closed
+        // until reconciliation records a consistent state.
+        logger.warn({ err: error, attempts: reconciliationAttempts }, 'Startup reconciliation will be retried');
       }
     }
     // A disabled loop still performs and retries startup reconciliation, but
     // never reaches a trading cycle.
-    if (!config.TRADING_LOOP_ENABLED) return;
+    if (!startupReconciled || !config.TRADING_LOOP_ENABLED) return;
+    await repo.recordOperationalCheck(at);
     phase = sessionPhase(at, undefined, Boolean(await repo.openPosition()));
-    if (phase !== 'FINISHED') await transition(phase, new Date(at.getTime() + nextDelay(phase, at)), at);
-    if (phase === 'TRADING' || phase === 'NO_NEW_POSITIONS' || isCloseOnlyPhase(phase)) {
+    if (phase !== 'FINISHED') await transition(phase, nextCycleAt(phase, at), at);
+    if (phase === 'TRADING') {
       await service.runOnce(at);
-      await repo.completeCycle(new Date());
+      await repo.completeDecisionCycle(new Date());
+    } else if (isCloseOnlyPhase(phase)) {
+      await service.runOnce(at);
     }
     phase = sessionPhase(at, undefined, Boolean(await repo.openPosition()));
     if (phase === 'FINISHED') {
-      // Persist the daily result before exposing a completed session.
+      await transition(phase, nextCycleAt(phase, new Date()), at);
+      // FINISHED is a trading state, not proof that ledger consolidation has
+      // succeeded. This path never invokes AI or order placement.
       await finishDailyIfPositionClosed(repo, exchange, at);
-      await transition(phase, new Date(at.getTime() + nextDelay(phase, at)), at);
     } else {
-      await transition(phase, new Date(at.getTime() + nextDelay(phase, at)), at);
+      await transition(phase, nextCycleAt(phase, new Date()), at);
     }
-  } catch (error) { logger.error({ err: error, phase }, 'Scheduled worker cycle failed'); }
+  } catch (error) { consolidationRetry = phase === 'FINISHED'; logger.error({ err: error, phase }, 'Scheduled worker cycle failed'); }
   finally {
-    if (!stopped)
+    ticking = false;
+    if (!stopped) {
+      const scheduledAt = startupReconciled
+        ? consolidationRetry ? new Date(Date.now() + 30_000) : nextCycleAt(phase ?? 'FORCE_CLOSE_PENDING', new Date())
+        : new Date(Date.now() + reconciliationRetryDelay(reconciliationAttempts));
       timer = setTimeout(
         () => void tick(),
-        startupReconciled
-          ? nextDelay(phase ?? 'FORCE_CLOSE_PENDING', at)
-          : reconciliationAttempts < reconciliationMaxAttempts
-            ? reconciliationRetryDelayMs
-            : nextDelay(phase ?? 'FORCE_CLOSE_PENDING', at),
+        Math.max(0, scheduledAt.getTime() - Date.now()),
       );
+    }
   }
 }
 await repo.ensureAccount(config.INITIAL_BANK_USDT); await repo.heartbeat();

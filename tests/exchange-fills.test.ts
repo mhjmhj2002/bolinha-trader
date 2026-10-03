@@ -26,7 +26,9 @@ describe('Binance fill preservation', () => {
     const urls: string[] = [];
     const client = new BinanceTestnetClient('key', 'secret', 'BTCUSDT', async (url) => {
       urls.push(String(url));
-      const body = urls.length === 1 ? filledOrder : [
+      // This mirrors GET /api/v3/order: it provides updateTime/time, not the
+      // transactTime supplied by a POST order response.
+      const body = urls.length === 1 ? { ...filledOrder, transactTime: undefined, updateTime: 1_700_000_000_123, time: 1_700_000_000_000 } : [
         { price: '100000', qty: '0.00007000', commission: '0.001', commissionAsset: 'BNB', id: 44 },
       ];
       return new Response(JSON.stringify(body), { status: 200 });
@@ -35,5 +37,14 @@ describe('Binance fill preservation', () => {
     expect(urls).toHaveLength(2);
     expect(urls[1]).toContain('/api/v3/myTrades');
     expect(order?.fills).toEqual([{ price: 100000, qty: 0.00007, commission: 0.001, commissionAsset: 'BNB', tradeId: '44' }]);
+    expect(order?.transactTime.toISOString()).toBe('2023-11-14T22:13:20.123Z');
+    expect(Number.isNaN(order?.transactTime.getTime() ?? NaN)).toBe(false);
+  });
+
+  it('rejects a Query Order response without any valid timestamp instead of creating Invalid Date', async () => {
+    let call = 0;
+    const client = new BinanceTestnetClient('key', 'secret', 'BTCUSDT', async () =>
+      new Response(JSON.stringify(++call === 1 ? { ...filledOrder, transactTime: undefined, updateTime: 'not-a-timestamp', time: null } : []), { status: 200 }));
+    await expect(client.orderByClientId('client-id')).rejects.toThrow('valid execution timestamp');
   });
 });
