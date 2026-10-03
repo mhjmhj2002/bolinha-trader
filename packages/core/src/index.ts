@@ -4,7 +4,6 @@ import { z } from 'zod';
 
 const bool = z.enum(['true', 'false']).default('false').transform((v) => v === 'true');
 const numeric = (fallback: number) => z.coerce.number().finite().default(fallback);
-const time = (fallback: string) => z.preprocess((value) => value === '' ? undefined : value, z.string().regex(/^\d{2}:\d{2}$/).default(fallback));
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   DATABASE_URL: z.string().url().default('postgres://bolinha:bolinha@localhost:5432/bolinha'),
@@ -12,11 +11,7 @@ const configSchema = z.object({
   BINANCE_ENV: z.literal('testnet').default('testnet'), BINANCE_API_KEY: z.string().default(''), BINANCE_API_SECRET: z.string().default(''),
   OPENROUTER_API_KEY: z.string().default(''),
   OPENROUTER_MODELS: z.string().default('poolside/laguna-s-2.1:free,qwen/qwen3.8-27b:free,google/gemma-4-31b-it:free,openrouter/free'),
-  SYMBOL: z.literal('BTCUSDT').default('BTCUSDT'), INITIAL_BANK_USDT: z.coerce.number().finite().positive().default(20),
-  MAX_POSITION_PERCENT: z.coerce.number().finite().min(0).max(100).default(100), TRADING_LOOP_ENABLED: bool,
-  TRADING_INTERVAL_SECONDS: z.coerce.number().finite().int().positive().default(600),
-  TRADING_TIMEZONE: z.literal('America/Sao_Paulo').default('America/Sao_Paulo'),
-  TRADING_START_TIME: time('09:00'), TRADING_STOP_NEW_POSITIONS_TIME: time('17:50'), FORCE_CLOSE_TIME: time('17:55'), TRADING_END_TIME: time('18:00')
+  SYMBOL: z.literal('BTCUSDT').default('BTCUSDT'), TRADING_LOOP_ENABLED: bool,
 });
 export type Config = z.infer<typeof configSchema>;
 export const config = configSchema.parse(process.env);
@@ -32,18 +27,36 @@ export const now = () => new Date();
 export const roundStepDown = (value: number, step: number) => Math.floor((value + 1e-12) / step) * step;
 
 export type SessionPhase = 'BEFORE_START' | 'TRADING' | 'NO_NEW_POSITIONS' | 'FORCE_CLOSE' | 'FORCE_CLOSE_PENDING' | 'FINISHED';
-export interface SessionSchedule { timezone: string; start: string; stopNewPositions: string; forceClose: string; end: string }
-export const sessionSchedule = (c: Pick<Config, 'TRADING_TIMEZONE' | 'TRADING_START_TIME' | 'TRADING_STOP_NEW_POSITIONS_TIME' | 'FORCE_CLOSE_TIME' | 'TRADING_END_TIME'> = config): SessionSchedule => ({
-  timezone: c.TRADING_TIMEZONE, start: c.TRADING_START_TIME, stopNewPositions: c.TRADING_STOP_NEW_POSITIONS_TIME, forceClose: c.FORCE_CLOSE_TIME, end: c.TRADING_END_TIME,
+export interface SessionSchedule { timezone: string; start: string; stopNewPositions: string; forceClose: string; end: string; intervalSeconds: number }
+export interface TradingConfiguration extends SessionSchedule { initialBankUsdt: number; maxPositionPercent: number; updatedAt?: Date | null }
+/** Bootstrap values only. Runtime operational behaviour must use PostgreSQL. */
+export const defaultTradingConfiguration: TradingConfiguration = Object.freeze({
+  timezone: 'America/Sao_Paulo', start: '09:00', stopNewPositions: '17:50', forceClose: '17:55', end: '18:00',
+  intervalSeconds: 600, initialBankUsdt: 20, maxPositionPercent: 100,
 });
+export const sessionSchedule = (configuration: Pick<TradingConfiguration, 'timezone' | 'start' | 'stopNewPositions' | 'forceClose' | 'end' | 'intervalSeconds'> = defaultTradingConfiguration): SessionSchedule => ({ ...configuration });
+const timeValue = /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
+const minutes = (value: string) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
+export const validateTradingConfiguration = (value: TradingConfiguration): TradingConfiguration => {
+  if (![value.start, value.stopNewPositions, value.forceClose, value.end].every((time) => timeValue.test(time)))
+    throw new Error('Configuration times must use HH:MM');
+  try { new Intl.DateTimeFormat('en-CA', { timeZone: value.timezone }).format(); }
+  catch { throw new Error('Configuration timezone is invalid'); }
+  if (!(minutes(value.start) < minutes(value.stopNewPositions) && minutes(value.stopNewPositions) < minutes(value.forceClose) && minutes(value.forceClose) < minutes(value.end)))
+    throw new Error('Configuration times must be strictly ordered');
+  if (!Number.isInteger(value.intervalSeconds) || value.intervalSeconds <= 0) throw new Error('Configuration intervalSeconds must be positive');
+  if (!Number.isFinite(value.initialBankUsdt) || value.initialBankUsdt <= 0) throw new Error('Configuration initialBankUsdt must be positive');
+  if (!Number.isFinite(value.maxPositionPercent) || value.maxPositionPercent <= 0 || value.maxPositionPercent > 100) throw new Error('Configuration maxPositionPercent must be between 0 and 100');
+  return value;
+};
 const localParts = (at: Date, timezone: string) => Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(at).filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]));
-export const sessionDay = (at = new Date(), timezone: string = config.TRADING_TIMEZONE) => { const p = localParts(at, timezone); return `${p.year}-${p.month}-${p.day}`; };
+export const sessionDay = (at = new Date(), timezone: string = defaultTradingConfiguration.timezone) => { const p = localParts(at, timezone); return `${p.year}-${p.month}-${p.day}`; };
 export const isSessionDay = (value: string) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const parsed = new Date(`${value}T00:00:00.000Z`);
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 };
-export const localTime = (at = new Date(), timezone: string = config.TRADING_TIMEZONE) => { const p = localParts(at, timezone); return `${p.hour}:${p.minute}:${p.second}`; };
+export const localTime = (at = new Date(), timezone: string = defaultTradingConfiguration.timezone) => { const p = localParts(at, timezone); return `${p.hour}:${p.minute}:${p.second}`; };
 /**
  * After the scheduled end, an open conceptual position keeps the worker in a
  * close-only state.  The caller supplies this persisted fact so a restart has

@@ -11,7 +11,7 @@ describe('dashboard/data aggregation', () => {
   it('builds a safe completed-day payload with position, P/L, model usage and incidents', async () => {
     const repo = dashboardRepository([
       [{ initial_bank_usdt: '20', cash_usdt: '18', realized_pnl_usdt: '-1', ai_cost_usd: '0.9' }],
-      [{ session_day: '2026-09-30', phase: 'FINISHED', timezone: 'America/Sao_Paulo', started_at: '2026-09-30T12:00:00Z', finished_at: '2026-09-30T21:00:00Z', last_cycle_at: '2026-09-30T20:50:00Z', next_cycle_at: null, cycles_today: '53' }],
+      [{ session_day: '2026-09-30', phase: 'FINISHED', timezone: 'America/Sao_Paulo', start_time: '18:30:00', stop_new_positions_time: '21:20:00', force_close_time: '21:25:00', end_time: '21:30:00', interval_seconds: '600', started_at: '2026-09-30T21:30:00Z', finished_at: '2026-10-01T00:30:00Z', last_cycle_at: '2026-10-01T00:20:00Z', next_cycle_at: null, cycles_today: '17' }],
       [{ initial_equity_usdt: '20', final_equity_usdt: '20.5', realized_pnl_usdt: '0.2', unrealized_pnl_usdt: '0', net_pnl_usdt: '0.5', ai_cost_usd: '0.0021', trade_count: '2', buy_count: '1', sell_count: '1', hold_count: '50', rejected_decision_count: '1', fees_usdt_known: '0.01', fallback_count: '1', error_count: '1', forced_close_occurred: false }],
       [{ cash_usdt: '10', equity_usdt: '20.5', realized_pnl_usdt: '0.2', unrealized_pnl_usdt: '0.3', net_pnl_usdt: '0.5', price: '105000', position_quantity: '0.0001', position_cost_usdt: '10', created_at: '2026-09-30T20:50:00Z' }],
       [{ side: 'SELL', quantity: '0.0001', quote_amount: '10.5', net_quantity: '0.0001', net_quote_amount: '10.49', gross_pnl_usdt: '0.5', fees_usdt_known: '0.01', net_pnl_usdt: '0.49', executed_at: '2026-09-30T20:00:00Z', binance_order_id: 'binance-1' }],
@@ -32,6 +32,7 @@ describe('dashboard/data aggregation', () => {
     expect(data.aiUsage.models[0]).toMatchObject({ model: 'Qwen', calls: 2 });
     expect(data.events).toEqual([expect.objectContaining({ level: 'ERROR', message: 'Rate limited' }), expect.objectContaining({ level: 'WARN', event: 'ai_fallback' })]);
     expect(data.summary).toMatchObject({ final: true, tradeCount: 2, errorCount: 1 });
+    expect(data.schedule).toEqual({ timezone: 'America/Sao_Paulo', startTime: '18:30', stopNewPositionsTime: '21:20', forceCloseTime: '21:25', endTime: '21:30', intervalSeconds: 600 });
     expect(JSON.stringify(data)).not.toContain('must not leak');
     expect(JSON.stringify(data)).not.toContain('raw_response');
   });

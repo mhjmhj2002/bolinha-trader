@@ -1,15 +1,15 @@
 /* global Chart, document, window */
 (() => {
-  const timezone = 'America/Sao_Paulo';
   const charts = {};
   let data = null;
   const $ = (id) => document.getElementById(id);
-  const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+  const timezone = () => data?.schedule?.timezone || data?.timezone || 'UTC';
+  const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: timezone() }).format(new Date());
   const number = (value, digits = 2) => value === null || value === undefined ? '—' : Number(value).toLocaleString('pt-BR', { minimumFractionDigits: digits, maximumFractionDigits: digits });
   const money = (value, currency = 'USDT') => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '' : '-'}${currency === 'US$' ? 'US$ ' : ''}${number(Math.abs(value))}${currency === 'USDT' ? ' USDT' : ''}`;
   const signedMoney = (value) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '+' : '-'}${number(Math.abs(value))} USDT`;
-  const time = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone, hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(iso)) : '—';
-  const dateTime = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone, dateStyle: 'short', timeStyle: 'short' }).format(new Date(iso)) : '—';
+  const time = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(iso)) : '—';
+  const dateTime = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), dateStyle: 'short', timeStyle: 'short' }).format(new Date(iso)) : '—';
   const escape = (value) => String(value ?? '—').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
   const badge = (value) => {
     const status = String(value || '—');
@@ -76,7 +76,7 @@
     $('events-table').innerHTML = events.length ? events.map((event) => `<tr><td>${time(event.at)}</td><td>${badge(event.level)}</td><td>${escape(event.event)}</td><td>${escape(event.message)}</td></tr>`).join('') : empty(4, includeInfo ? 'Nenhum evento no dia.' : 'Nenhum WARN ou ERROR no dia.');
   }
   function renderSession(payload) {
-    const schedule = [['START', '09:00'], ['STOP BUY', '17:50'], ['FORCE CLOSE', '17:55'], ['END', '18:00']];
+    const schedule = [['START', payload.schedule.startTime], ['STOP BUY', payload.schedule.stopNewPositionsTime], ['FORCE CLOSE', payload.schedule.forceCloseTime], ['END', payload.schedule.endTime]];
     const phases = { START: 'TRADING', 'STOP BUY': 'NO_NEW_POSITIONS', 'FORCE CLOSE': 'FORCE_CLOSE', END: 'FINISHED' };
     $('session-timeline').innerHTML = schedule.map(([name, defaultAt]) => `<li class="${payload.session?.phase === phases[name] ? 'active' : ''}"><strong>${defaultAt}</strong><span class="ms-2">${name}</span></li>`).join('');
     const summary = payload.summary;
@@ -85,7 +85,7 @@
   function render(payload) {
     data = payload;
     $('date-filter').value = payload.date;
-    $('session-date').textContent = `${payload.date} · ${payload.timezone}${payload.historical ? ' · Histórico' : ''}`;
+    $('session-date').textContent = `${payload.date} · ${payload.timezone}${payload.historical ? ' · Histórico' : ''} · Configuração: ${payload.schedule.startTime} → ${payload.schedule.endTime} · Intervalo: ${Number(payload.schedule.intervalSeconds) / 60} min`;
     $('overall-status').textContent = payload.health.status;
     $('overall-status').className = `badge px-3 py-2 ${badge(payload.health.status).match(/text-bg-[^"]+/)?.[0] || 'text-bg-secondary'}`;
     $('connection').textContent = `Última atualização: ${time(payload.health.timestamp)}`;

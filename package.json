@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "typecheck": "tsc -b",
-    "test": "TRADING_START_TIME=09:00 TRADING_STOP_NEW_POSITIONS_TIME=17:50 FORCE_CLOSE_TIME=17:55 TRADING_END_TIME=18:00 vitest run",
+    "test": "vitest run",
     "db:migrate": "tsx packages/database/src/migrate.ts",
     "trading:once": "docker compose exec -T worker pnpm --filter @bolinha/worker trading:once",
     "trading:once:local": "pnpm --filter @bolinha/worker trading:once",

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { config, logger, sessionPhase } from '@bolinha/core';
+import { config, defaultTradingConfiguration, logger, sessionPhase, type TradingConfiguration } from '@bolinha/core';
 import { makeSnapshot } from '@bolinha/market-data';
 import { OpenRouterClient, buildPrompt } from '@bolinha/ai';
 import { applyRisk } from '@bolinha/risk-engine';
@@ -28,6 +28,11 @@ export class TradingService {
   private async event(severity: Severity, type: string, message: string, metadata?: unknown) {
     await this.repo.event(severity, type, message, metadata);
     logger.info({ event: type, severity, metadata }, message);
+  }
+
+  private async operationalConfiguration(): Promise<TradingConfiguration> {
+    const configurable = this.repo as TradingRepository & { configuration?: () => Promise<TradingConfiguration> };
+    return configurable.configuration ? configurable.configuration() : { ...defaultTradingConfiguration };
   }
 
   private async exclusive<T>(work: () => Promise<T>): Promise<T | { action: 'HOLD'; reason: string }> {
@@ -118,7 +123,7 @@ export class TradingService {
     if (!reconciliationRepo.pendingOrders || !reconciliationRepo.reconciliationStarted || !reconciliationRepo.reconciliationCompleted || !reconciliationRepo.reconciliationFailed || !reconciliationRepo.stateConsistency)
       return { status: 'OK' as const, pendingOrders: 0 };
 
-    await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+    await this.repo.ensureAccount((await this.operationalConfiguration()).initialBankUsdt);
     const metricsRepo = this.repo as TradingRepository & { recordReconciliationRun?: () => Promise<void> };
     await metricsRepo.recordReconciliationRun?.();
     await reconciliationRepo.reconciliationStarted();
@@ -238,24 +243,25 @@ export class TradingService {
     return order;
   }
 
-  async runOnce(at = new Date()) {
-    return this.exclusive(() => this.runOnceLocked(at));
+  async runOnce(at = new Date(), configuration?: TradingConfiguration) {
+    const effective = configuration ?? await this.operationalConfiguration();
+    return this.exclusive(() => this.runOnceLocked(at, effective));
   }
 
-  private async runOnceLocked(at: Date) {
-    await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+  private async runOnceLocked(at: Date, configuration: TradingConfiguration) {
+    await this.repo.ensureAccount(configuration.initialBankUsdt);
     await this.repo.heartbeat();
     const ready = await this.tradingReady();
     if (!ready.ready) {
       await this.event('WARN', 'cycle_skipped', 'Trading cycle blocked pending reconciliation', { reason: ready.reason });
       return { action: 'HOLD' as const, reason: ready.reason };
     }
-    const phase = sessionPhase(at, undefined, Boolean(await this.repo.openPosition()));
+    const phase = sessionPhase(at, configuration, Boolean(await this.repo.openPosition()));
     if (phase === 'BEFORE_START' || phase === 'FINISHED') {
       await this.event('INFO', 'cycle_skipped', 'Trading cycle skipped outside the daily session', { phase });
       return { action: 'HOLD' as const, reason: `Session phase is ${phase}` };
     }
-    if (phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING') return this.forceClosePositionLocked();
+    if (phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING') return this.forceClosePositionLocked(configuration);
     await this.event('INFO', 'cycle_started', 'Trading cycle started', { symbol: config.SYMBOL });
     try {
       let market;
@@ -303,7 +309,7 @@ export class TradingService {
         account,
         position,
         rules,
-        maxPositionPercent: config.MAX_POSITION_PERCENT,
+        maxPositionPercent: configuration.maxPositionPercent,
         duplicateOrderPending: pending,
       });
       if (phase === 'NO_NEW_POSITIONS' && risk.action === 'BUY') {
@@ -317,10 +323,10 @@ export class TradingService {
       // time fetching market data or asking the model to cross it. Re-read the
       // clock immediately before the order path; the phase captured above is
       // intentionally not trusted for a new position.
-      if (risk.action === 'BUY' && sessionPhase(new Date()) !== 'TRADING') {
+      if (risk.action === 'BUY' && sessionPhase(new Date(), configuration) !== 'TRADING') {
         risk = { action: 'HOLD', amountUsdt: 0, quantity: 0, rejectionReason: 'New positions are blocked for today' };
         await this.event('WARN', 'new_positions_blocked', 'BUY blocked after revalidating the cutoff before submission', {
-          phaseAtSubmission: sessionPhase(new Date()),
+          phaseAtSubmission: sessionPhase(new Date(), configuration),
           requestedAction: response.decision.action,
         });
       }
@@ -369,12 +375,13 @@ export class TradingService {
     }
   }
 
-  async forceClosePosition() {
-    return this.exclusive(() => this.forceClosePositionLocked());
+  async forceClosePosition(configuration?: TradingConfiguration) {
+    const effective = configuration ?? await this.operationalConfiguration();
+    return this.exclusive(() => this.forceClosePositionLocked(effective));
   }
 
-  private async forceClosePositionLocked() {
-    await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+  private async forceClosePositionLocked(configuration: TradingConfiguration) {
+    await this.repo.ensureAccount(configuration.initialBankUsdt);
     const ready = await this.tradingReady();
     if (!ready.ready) {
       await this.event('WARN', 'force_close_blocked', 'Forced close blocked pending reconciliation', { reason: ready.reason });
@@ -410,7 +417,7 @@ export class TradingService {
       account,
       position,
       rules,
-      maxPositionPercent: config.MAX_POSITION_PERCENT,
+      maxPositionPercent: configuration.maxPositionPercent,
       // A pending SELL is retried with its persisted client id below. A pending
       // BUY is never retried during the close-only window.
       duplicateOrderPending: pending ? pending.side !== 'SELL' : await this.repo.pendingOrder(),
@@ -435,7 +442,8 @@ export class TradingService {
     if (config.BINANCE_ENV !== 'testnet')
       throw new Error('Smoke test refuses any Binance environment except testnet');
     await this.repo.health();
-    await this.repo.ensureAccount(config.INITIAL_BANK_USDT);
+    const configuration = await this.operationalConfiguration();
+    await this.repo.ensureAccount(configuration.initialBankUsdt);
     const initialAccount = await this.repo.account();
     if (await this.repo.openPosition())
       throw new Error('Smoke test aborted: a conceptual BTC position is already open');
@@ -465,7 +473,7 @@ export class TradingService {
       account: initialAccount,
       position: null,
       rules,
-      maxPositionPercent: config.MAX_POSITION_PERCENT,
+      maxPositionPercent: configuration.maxPositionPercent,
       duplicateOrderPending: await this.repo.pendingOrder(),
     });
     if (risk.action !== 'BUY') throw new Error(`Smoke test technical BUY rejected: ${risk.rejectionReason}`);

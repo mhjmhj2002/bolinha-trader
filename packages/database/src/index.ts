@@ -1,6 +1,6 @@
 import pg from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import { buildDailyReport, config, isSessionDay, sessionDay, sessionSchedule, type Account, type DailyReport, type DailyReportInput, type Position, type SessionPhase } from '@bolinha/core';
+import { buildDailyReport, config, defaultTradingConfiguration, isSessionDay, sessionDay, sessionPhase, sessionSchedule, validateTradingConfiguration, type Account, type DailyReport, type DailyReportInput, type Position, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
 import type { AiDecision, AiUsage } from '@bolinha/ai';
 import type { MarketSnapshot } from '@bolinha/market-data';
 import { executionAccounting, type ExecutionFill } from './accounting.js';
@@ -9,6 +9,13 @@ export const pool = new pg.Pool({ connectionString: config.DATABASE_URL, max: 5 
 export const db = drizzle(pool); // Drizzle is the ORM boundary; explicit SQL below keeps ledger transactions auditable.
 type Row = Record<string, unknown>;
 const num = (value: unknown) => Number(value);
+const clock = (value: unknown) => String(value).slice(0, 5);
+const configurationFromRow = (row: Row): TradingConfiguration => validateTradingConfiguration({
+  timezone: String(row.timezone), start: clock(row.start_time), stopNewPositions: clock(row.stop_new_positions_time),
+  forceClose: clock(row.force_close_time), end: clock(row.end_time), intervalSeconds: num(row.interval_seconds),
+  initialBankUsdt: num(row.initial_bank_usdt), maxPositionPercent: num(row.max_position_percent),
+  updatedAt: row.updated_at ? new Date(String(row.updated_at)) : null,
+});
 /** Never pass JS arrays/objects directly to pg for a jsonb parameter. */
 export const serializeJsonb = (value: unknown) => JSON.stringify(value);
 export type PendingOrder = {
@@ -24,11 +31,160 @@ export type ReconciliationState = {
   lastReconciliationAt: Date | null;
   lastError: string | null;
 };
+export type ConfigurationEditability = {
+  editable: boolean;
+  blockedReason: 'TRADING_SESSION_ACTIVE' | 'OPEN_POSITION' | 'PENDING_ORDER' | 'RECONCILIATION_NOT_OK' | 'TRADING_OPERATION_IN_PROGRESS' | null;
+  sessionPhase: SessionPhase;
+  openPosition: boolean;
+  pendingOrders: number;
+  reconciliationStatus: ReconciliationState['status'];
+  stateConsistent: boolean;
+};
+export class ConfigurationBlockedError extends Error {
+  constructor(public readonly state: ConfigurationEditability) {
+    super('Trading em execução. Configuração operacional não pode ser alterada agora.');
+    this.name = 'ConfigurationBlockedError';
+  }
+}
+const configurationMetadata = (configuration: TradingConfiguration) => ({
+  timezone: configuration.timezone, startTime: configuration.start, stopNewPositionsTime: configuration.stopNewPositions,
+  forceCloseTime: configuration.forceClose, endTime: configuration.end, intervalSeconds: configuration.intervalSeconds,
+  initialBankUsdt: configuration.initialBankUsdt, maxPositionPercent: configuration.maxPositionPercent,
+});
 export class TradingRepository {
   constructor(private client: pg.Pool = pool) {}
   async health() {
     await this.client.query('select 1');
     return true;
+  }
+  /** Reads PostgreSQL on each operational boundary. It is one query per worker
+   * tick, so configuration changes take effect without a restart. */
+  async configuration(): Promise<TradingConfiguration> {
+    let result = await this.client.query<Row>('select * from trading_configuration order by id limit 1');
+    if (!result.rows[0]) {
+      await this.client.query(
+        `insert into trading_configuration(id,timezone,start_time,stop_new_positions_time,force_close_time,end_time,interval_seconds,initial_bank_usdt,max_position_percent)
+         select 1,$1,$2::time,$3::time,$4::time,$5::time,$6,$7,$8
+         where not exists (select 1 from trading_configuration)
+         on conflict (id) do nothing`,
+        [defaultTradingConfiguration.timezone, defaultTradingConfiguration.start, defaultTradingConfiguration.stopNewPositions, defaultTradingConfiguration.forceClose, defaultTradingConfiguration.end, defaultTradingConfiguration.intervalSeconds, defaultTradingConfiguration.initialBankUsdt, defaultTradingConfiguration.maxPositionPercent],
+      );
+      result = await this.client.query<Row>('select * from trading_configuration order by id limit 1');
+    }
+    // Lightweight repository doubles used by pure read-model tests have no
+    // mutable backing store. Production PostgreSQL reaches this only if a
+    // migration/permission failure prevented the bootstrap INSERT.
+    if (!result.rows[0]) return { ...defaultTradingConfiguration };
+    return configurationFromRow(result.rows[0]);
+  }
+  async configurationEditability(at = new Date(), configuration?: TradingConfiguration): Promise<ConfigurationEditability> {
+    configuration ??= await this.configuration();
+    const [position, pendingOrders, reconciliation, session] = await Promise.all([
+      this.openPosition(), this.pendingOrderCount(), this.reconciliationState(),
+      this.session(at, configuration.timezone),
+    ]);
+    return this.editabilityFromState(at, configuration, Boolean(position), pendingOrders, reconciliation, session?.phase as SessionPhase | undefined);
+  }
+  private editabilityFromState(
+    at: Date, configuration: TradingConfiguration, hasOpenPosition: boolean, pendingOrders: number, reconciliation: ReconciliationState, persistedPhase?: SessionPhase,
+  ): ConfigurationEditability {
+    const clockPhase = sessionPhase(at, configuration, hasOpenPosition);
+    const persistedActive = persistedPhase && ['TRADING', 'NO_NEW_POSITIONS', 'FORCE_CLOSE', 'FORCE_CLOSE_PENDING'].includes(persistedPhase);
+    const phase = persistedActive ? persistedPhase : clockPhase;
+    const activePhase = ['TRADING', 'NO_NEW_POSITIONS', 'FORCE_CLOSE', 'FORCE_CLOSE_PENDING'].includes(phase);
+    const blockedReason = activePhase ? 'TRADING_SESSION_ACTIVE'
+      : hasOpenPosition ? 'OPEN_POSITION'
+        : pendingOrders > 0 ? 'PENDING_ORDER'
+          : reconciliation.status !== 'OK' || !reconciliation.stateConsistent ? 'RECONCILIATION_NOT_OK'
+            : null;
+    return { editable: blockedReason === null, blockedReason, sessionPhase: phase, openPosition: hasOpenPosition, pendingOrders, reconciliationStatus: reconciliation.status, stateConsistent: reconciliation.stateConsistent };
+  }
+  /**
+   * Changes the singleton live row and appends an immutable version in the
+   * same transaction. The trading advisory lock closes the race with a worker
+   * cycle that may otherwise submit an order while this request is in flight.
+   */
+  async updateConfiguration(next: TradingConfiguration, at = new Date(), eventName: 'configuration_updated' | 'configuration_created' = 'configuration_updated'): Promise<TradingConfiguration> {
+    validateTradingConfiguration(next);
+    const connection = await this.client.connect();
+    try {
+      await connection.query('begin');
+      const configurationLock = await connection.query<{ acquired: boolean }>("select pg_try_advisory_xact_lock(hashtext('bolinha-configuration-change')) as acquired");
+      const tradingLock = configurationLock.rows[0]?.acquired
+        ? await connection.query<{ acquired: boolean }>("select pg_try_advisory_xact_lock(hashtext('bolinha-trading-cycle')) as acquired")
+        : { rows: [{ acquired: false }] };
+      const currentResult = await connection.query<Row>('select * from trading_configuration where id=1 for update');
+      const current = currentResult.rows[0] ? configurationFromRow(currentResult.rows[0]) : await this.configuration();
+      const attemptedPayload = { previous: configurationMetadata(current), next: configurationMetadata(next), at: at.toISOString() };
+      await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
+        'INFO', 'configuration_update_attempted', 'Operational configuration update attempted', serializeJsonb(attemptedPayload), at,
+      ]);
+      if (!configurationLock.rows[0]?.acquired || !tradingLock.rows[0]?.acquired) {
+        const state: ConfigurationEditability = {
+          editable: false, blockedReason: 'TRADING_OPERATION_IN_PROGRESS', sessionPhase: sessionPhase(at, current),
+          openPosition: false, pendingOrders: 0, reconciliationStatus: 'RUNNING', stateConsistent: false,
+        };
+        await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
+          'WARN', 'configuration_update_blocked', 'Operational configuration update blocked', serializeJsonb({ ...attemptedPayload, reason: state.blockedReason }), at,
+        ]);
+        await connection.query('commit');
+        throw new ConfigurationBlockedError(state);
+      }
+      const [positionResult, pendingResult, reconciliationResult, sessionResult] = await Promise.all([
+        connection.query("select 1 from positions where status='OPEN' limit 1"),
+        connection.query("select count(*) from orders where status='PENDING'"),
+        connection.query<Row>('select * from reconciliation_state where id=true'),
+        connection.query<Row>('select phase from trading_sessions where session_day=$1', [sessionDay(at, current.timezone)]),
+      ]);
+      const reconciliationRow = reconciliationResult.rows[0];
+      const reconciliation: ReconciliationState = !reconciliationRow
+        ? { status: 'ERROR', stateConsistent: false, lastReconciliationAt: null, lastError: 'Startup reconciliation has not run' }
+        : { status: String(reconciliationRow.status) as ReconciliationState['status'], stateConsistent: Boolean(reconciliationRow.state_consistent), lastReconciliationAt: reconciliationRow.last_reconciled_at ? new Date(String(reconciliationRow.last_reconciled_at)) : null, lastError: reconciliationRow.last_error === null ? null : String(reconciliationRow.last_error) };
+      const state = this.editabilityFromState(at, current, positionResult.rows.length > 0, Number(pendingResult.rows[0].count), reconciliation, sessionResult.rows[0]?.phase as SessionPhase | undefined);
+      if (!state.editable) {
+        await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
+          'WARN', 'configuration_update_blocked', 'Operational configuration update blocked', serializeJsonb({ ...attemptedPayload, reason: state.blockedReason }), at,
+        ]);
+        await connection.query('commit');
+        throw new ConfigurationBlockedError(state);
+      }
+      await connection.query(
+        `update trading_configuration set timezone=$1,start_time=$2::time,stop_new_positions_time=$3::time,force_close_time=$4::time,end_time=$5::time,
+         interval_seconds=$6,initial_bank_usdt=$7,max_position_percent=$8 where id=1`,
+        [next.timezone, next.start, next.stopNewPositions, next.forceClose, next.end, next.intervalSeconds, next.initialBankUsdt, next.maxPositionPercent],
+      );
+      await connection.query('update trading_configuration_versions set valid_to=$1 where configuration_id=1 and valid_to is null', [at]);
+      const version = await connection.query<{ id: number }>(
+        `insert into trading_configuration_versions(configuration_id,timezone,start_time,stop_new_positions_time,force_close_time,end_time,interval_seconds,initial_bank_usdt,max_position_percent,valid_from)
+         values(1,$1,$2::time,$3::time,$4::time,$5::time,$6,$7,$8,$9) returning id`,
+        [next.timezone, next.start, next.stopNewPositions, next.forceClose, next.end, next.intervalSeconds, next.initialBankUsdt, next.maxPositionPercent, at],
+      );
+      // A BEFORE_START row is only a planning marker, not historical
+      // evidence yet. Keep it aligned with a safe edit so the next session is
+      // stamped with the configuration the worker will actually use.
+      await connection.query(
+        `update trading_sessions set timezone=$1,start_time=$2::time,stop_new_positions_time=$3::time,force_close_time=$4::time,end_time=$5::time,
+         interval_seconds=$6,configuration_version_id=$7,updated_at=$8 where session_day=$9 and phase='BEFORE_START' and started_at is null`,
+        [next.timezone, next.start, next.stopNewPositions, next.forceClose, next.end, next.intervalSeconds, version.rows[0].id, at, sessionDay(at, current.timezone)],
+      );
+      await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
+        'INFO', eventName, eventName === 'configuration_created' ? 'Operational configuration version created' : 'Operational configuration updated', serializeJsonb(attemptedPayload), at,
+      ]);
+      await connection.query('commit');
+      return { ...next, updatedAt: at };
+    } catch (error) {
+      try { await connection.query('rollback'); } catch { /* already committed audit before a blocked response */ }
+      throw error;
+    } finally { connection.release(); }
+  }
+  configurationForSession(session: Row | null | undefined, fallback: TradingConfiguration): TradingConfiguration {
+    if (!session?.start_time || !session.stop_new_positions_time || !session.force_close_time || !session.end_time || !session.interval_seconds)
+      return fallback;
+    return validateTradingConfiguration({
+      timezone: String(session.timezone), start: clock(session.start_time), stopNewPositions: clock(session.stop_new_positions_time),
+      forceClose: clock(session.force_close_time), end: clock(session.end_time), intervalSeconds: num(session.interval_seconds),
+      initialBankUsdt: fallback.initialBankUsdt, maxPositionPercent: fallback.maxPositionPercent,
+    });
   }
   async ensureAccount(initial: number): Promise<Account> {
     await this.client.query(
@@ -131,8 +287,10 @@ export class TradingRepository {
       finally { await connection.query("select pg_advisory_unlock(hashtext('bolinha-trading-cycle'))"); }
     } finally { connection.release(); }
   }
-  async updateSession(phase: SessionPhase, nextCycleAt: Date | null, at = new Date()) {
-    const day = sessionDay(at);
+  async updateSession(phase: SessionPhase, nextCycleAt: Date | null, configurationOrAt: TradingConfiguration | Date = defaultTradingConfiguration, maybeAt = new Date()) {
+    const configuration = configurationOrAt instanceof Date ? defaultTradingConfiguration : configurationOrAt;
+    const at = configurationOrAt instanceof Date ? configurationOrAt : maybeAt;
+    const day = sessionDay(at, configuration.timezone);
     const existing = await this.client.query<Row>('select phase from trading_sessions where session_day=$1', [day]);
     const previous = existing.rows[0]?.phase as SessionPhase | undefined;
     await this.client.query(
@@ -145,7 +303,19 @@ export class TradingRepository {
          started_at=coalesce(trading_sessions.started_at, case when excluded.phase='TRADING'::varchar(32) then excluded.updated_at else null::timestamptz end),
          finished_at=case when excluded.phase='FINISHED'::varchar(32) then coalesce(trading_sessions.finished_at,excluded.updated_at) else trading_sessions.finished_at end,
          updated_at=excluded.updated_at`,
-      [day, config.TRADING_TIMEZONE, phase, at, nextCycleAt],
+      [day, configuration.timezone, phase, at, nextCycleAt],
+    );
+    // Only fill a snapshot once. Future configuration edits must never rewrite
+    // a historical session's effective schedule.
+    await this.client.query(
+      `update trading_sessions set start_time=coalesce(start_time,$2::time),
+       stop_new_positions_time=coalesce(stop_new_positions_time,$3::time), force_close_time=coalesce(force_close_time,$4::time),
+       end_time=coalesce(end_time,$5::time), interval_seconds=coalesce(interval_seconds,$6),
+       configuration_version_id=coalesce(configuration_version_id,(
+         select id from trading_configuration_versions where configuration_id=1 and valid_to is null order by id desc limit 1
+       ))
+       where session_day=$1`,
+      [day, configuration.start, configuration.stopNewPositions, configuration.forceClose, configuration.end, configuration.intervalSeconds],
     );
     return { day, changed: previous !== phase, previous };
   }
@@ -175,19 +345,20 @@ export class TradingRepository {
       [sessionDay(at), at],
     );
   }
-  async session(at = new Date()) {
-    return (await this.client.query('select * from trading_sessions where session_day=$1', [sessionDay(at)])).rows[0] ?? null;
+  async session(at = new Date(), timezone = defaultTradingConfiguration.timezone) {
+    return (await this.client.query('select * from trading_sessions where session_day=$1', [sessionDay(at, timezone)])).rows[0] ?? null;
   }
   /** Recovery path for a stopped worker: record the configured end, never "now". */
-  async markSessionFinishedAtScheduledEnd(at = new Date()) {
-    const day = sessionDay(at);
-    const schedule = sessionSchedule();
+  async markSessionFinishedAtScheduledEnd(at = new Date(), configuration?: TradingConfiguration) {
+    configuration ??= await this.configuration();
+    const day = sessionDay(at, configuration.timezone);
+    const schedule = sessionSchedule(configuration);
     await this.client.query(
       `update trading_sessions set phase='FINISHED',finished_at=coalesce(finished_at, (($1::date + $2::time) at time zone $3)),
        next_cycle_at=null,updated_at=$4 where session_day=$1 and phase <> 'FINISHED'`,
-      [day, schedule.end, config.TRADING_TIMEZONE, at],
+      [day, schedule.end, schedule.timezone, at],
     );
-    return this.session(at);
+    return this.session(at, schedule.timezone);
   }
   async event(level: string, event: string, message: string, payload?: unknown) {
     await this.client.query('insert into system_events(level,event,message,payload) values($1,$2,$3,$4::jsonb)', [
@@ -461,19 +632,20 @@ export class TradingRepository {
       [sessionDay(at), at],
     );
   }
-  async createDailyResult(price: number, at = new Date()) {
-    const day = sessionDay(at);
+  async createDailyResult(price: number, at = new Date(), configuration?: TradingConfiguration) {
+    configuration ??= await this.configuration();
+    const day = sessionDay(at, configuration.timezone);
     const session = await this.sessionForDay(day);
     if (!session || String(session.phase) !== 'FINISHED')
       throw new Error('Daily result can only be consolidated after the session is FINISHED');
     if (await this.openPosition())
       throw new Error('Daily result cannot be consolidated while a conceptual position is open');
-    const schedule = sessionSchedule();
+    const schedule = sessionSchedule(this.configurationForSession(session, configuration));
     const finishedAt = session.finished_at
       ? new Date(String(session.finished_at))
       : (await this.client.query<{ at: Date }>(
         "select (($1::date + $2::time) at time zone $3) as at",
-        [day, schedule.end, config.TRADING_TIMEZONE],
+        [day, schedule.end, schedule.timezone],
       )).rows[0].at;
     const startedAt = session.started_at ? new Date(String(session.started_at)) : finishedAt;
     const performance = await this.performance(price);
@@ -503,7 +675,7 @@ export class TradingRepository {
       `insert into daily_results(day,session_day,timezone,equity_usdt,initial_equity_usdt,final_equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,fees_by_asset,gross_return_pct,trade_count,buy_count,sell_count,hold_count,rejected_decision_count,ai_call_count,ai_cost_usd,models_used,fallback_count,error_count,forced_close_occurred,started_at,finished_at)
        values($1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25)
        on conflict(session_day) where session_day is not null do update set final_equity_usdt=excluded.final_equity_usdt,equity_usdt=excluded.equity_usdt,realized_pnl_usdt=excluded.realized_pnl_usdt,unrealized_pnl_usdt=excluded.unrealized_pnl_usdt,gross_pnl_usdt=excluded.gross_pnl_usdt,fees_usdt_known=excluded.fees_usdt_known,net_pnl_usdt=excluded.net_pnl_usdt,fees_by_asset=excluded.fees_by_asset,gross_return_pct=excluded.gross_return_pct,trade_count=excluded.trade_count,buy_count=excluded.buy_count,sell_count=excluded.sell_count,hold_count=excluded.hold_count,rejected_decision_count=excluded.rejected_decision_count,ai_call_count=excluded.ai_call_count,ai_cost_usd=excluded.ai_cost_usd,models_used=excluded.models_used,fallback_count=excluded.fallback_count,error_count=excluded.error_count,forced_close_occurred=excluded.forced_close_occurred,finished_at=excluded.finished_at`,
-      [at, day, config.TRADING_TIMEZONE, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, num(metrics.gross_pnl), dailyFees.feesUsdtKnown, num(metrics.net_pnl), serializeJsonb(dailyFees.feesByAsset), ((performance.equityUsdt-initialEquityUsdt)/initialEquityUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, serializeJsonb(metrics.models ?? []), metrics.fallback_count, metrics.error_count, metrics.forced_close, startedAt, finishedAt],
+      [at, day, schedule.timezone, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, num(metrics.gross_pnl), dailyFees.feesUsdtKnown, num(metrics.net_pnl), serializeJsonb(dailyFees.feesByAsset), ((performance.equityUsdt-initialEquityUsdt)/initialEquityUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, serializeJsonb(metrics.models ?? []), metrics.fallback_count, metrics.error_count, metrics.forced_close, startedAt, finishedAt],
     );
     // Older sessions predate the explicit counter; the persisted decision
     // evidence is authoritative when recovering their daily result.
@@ -526,13 +698,13 @@ export class TradingRepository {
     for (const row of daily.rows) { feesByAsset[String(row.asset)] = num(row.amount); feesUsdtKnown += num(row.amount_usdt); }
     return { feesByAsset, feesUsdtKnown };
   }
-  private async feeSummary(day?: string) {
+  private async feeSummary(day?: string, timezone = defaultTradingConfiguration.timezone) {
     const daily = day
       ? await this.client.query<Row>(
         `select tf.asset, coalesce(sum(tf.amount),0) as amount, coalesce(sum(tf.amount_usdt),0) as amount_usdt
          from trade_fees tf join trades t on t.id=tf.trade_id
          where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1 group by tf.asset`,
-        [day, config.TRADING_TIMEZONE],
+        [day, timezone],
       )
       : await this.client.query<Row>('select asset, coalesce(sum(amount),0) as amount, coalesce(sum(amount_usdt),0) as amount_usdt from trade_fees group by asset');
     const feesByAsset: Record<string, number> = {};
@@ -550,7 +722,6 @@ export class TradingRepository {
    */
   async dailyReport(day = sessionDay()): Promise<DailyReport> {
     if (!isSessionDay(day)) throw new Error('date must use the YYYY-MM-DD calendar format');
-    const schedule = sessionSchedule();
     const localDay = [day];
     const [sessionResult, dailyResult, accountResult, operationResult, aiResult, modelResult, eventResult, pendingResult, rejectedResult, positionResult] = await Promise.all([
       this.client.query<Row>('select * from trading_sessions where session_day=$1', [day]),
@@ -602,13 +773,15 @@ export class TradingRepository {
       this.client.query<Row>(
         `select exists(
            select 1 from positions
-           where opened_at <= (($1::date + $2::time) at time zone $3)
-             and (closed_at is null or closed_at > (($1::date + $2::time) at time zone $3))
+           where opened_at <= (($1::date + coalesce((select end_time from trading_sessions where session_day=$1::date),$2::time)) at time zone coalesce((select timezone from trading_sessions where session_day=$1::date),$3))
+             and (closed_at is null or closed_at > (($1::date + coalesce((select end_time from trading_sessions where session_day=$1::date),$2::time)) at time zone coalesce((select timezone from trading_sessions where session_day=$1::date),$3)))
          ) as open_after_end`,
-        [day, schedule.end, config.TRADING_TIMEZONE],
+        [day, defaultTradingConfiguration.end, defaultTradingConfiguration.timezone],
       ),
     ]);
     const sessionRow = sessionResult.rows[0];
+    const currentConfiguration = await this.configuration();
+    const schedule = sessionSchedule(this.configurationForSession(sessionRow, currentConfiguration));
     const dailyRow = dailyResult.rows[0];
     const accountRow = accountResult.rows[0];
     const operations = operationResult.rows[0];
@@ -633,7 +806,7 @@ export class TradingRepository {
     const models = Object.fromEntries(modelResult.rows.map((row) => [String(row.model), num(row.calls)]));
     const startMinutes = Number(schedule.start.slice(0, 2)) * 60 + Number(schedule.start.slice(3));
     const stopMinutes = Number(schedule.stopNewPositions.slice(0, 2)) * 60 + Number(schedule.stopNewPositions.slice(3));
-    const expectedCycles = Math.max(0, Math.floor((stopMinutes - startMinutes) / (config.TRADING_INTERVAL_SECONDS / 60)));
+    const expectedCycles = Math.max(0, Math.floor((stopMinutes - startMinutes) / (schedule.intervalSeconds / 60)));
     const initialUsdt = dailyRow?.initial_equity_usdt === null || dailyRow?.initial_equity_usdt === undefined
       ? sessionRow?.initial_equity_usdt === null || sessionRow?.initial_equity_usdt === undefined
         ? accountRow ? num(accountRow.initial_bank_usdt) : null
@@ -695,7 +868,9 @@ export class TradingRepository {
    */
   async dashboardData(day: string) {
     if (!isSessionDay(day)) throw new Error('date must use YYYY-MM-DD calendar format');
-    const localDay = [day, config.TRADING_TIMEZONE];
+    // Preserve the query shape of the dashboard read model; the effective
+    // schedule is resolved from the session snapshot after these reads.
+    const localDay = [day, defaultTradingConfiguration.timezone];
     const [accountResult, sessionResult, dailyResult, snapshotsResult, tradesResult, decisionsResult, usageResult, eventsResult] = await Promise.all([
       this.client.query<Row>('select initial_bank_usdt,cash_usdt,realized_pnl_usdt,ai_cost_usd from trading_account order by id limit 1'),
       this.client.query<Row>('select * from trading_sessions where session_day=$1', [day]),
@@ -723,6 +898,8 @@ export class TradingRepository {
     ]);
     const account = accountResult.rows[0];
     const session = sessionResult.rows[0] ?? null;
+    const currentConfiguration = await this.configuration();
+    const schedule = sessionSchedule(this.configurationForSession(session, currentConfiguration));
     const daily = dailyResult.rows[0] ?? null;
     const snapshots = snapshotsResult.rows.map((row) => ({
       at: new Date(String(row.created_at)).toISOString(), cashUsdt: num(row.cash_usdt), equityUsdt: num(row.equity_usdt),
@@ -754,6 +931,7 @@ export class TradingRepository {
     const realizedPnlUsdt = daily?.realized_pnl_usdt === null || daily?.realized_pnl_usdt === undefined ? latest?.realizedPnlUsdt ?? 0 : num(daily.realized_pnl_usdt);
     const unrealizedPnlUsdt = daily?.unrealized_pnl_usdt === null || daily?.unrealized_pnl_usdt === undefined ? latest?.unrealizedPnlUsdt ?? 0 : num(daily.unrealized_pnl_usdt);
     return {
+      schedule: { timezone: schedule.timezone, startTime: schedule.start, stopNewPositionsTime: schedule.stopNewPositions, forceCloseTime: schedule.forceClose, endTime: schedule.end, intervalSeconds: schedule.intervalSeconds },
       session: session && { day, phase: String(session.phase), timezone: String(session.timezone), startedAt: session.started_at ? new Date(String(session.started_at)).toISOString() : null, finishedAt: session.finished_at ? new Date(String(session.finished_at)).toISOString() : null, lastCycleAt: session.last_cycle_at ? new Date(String(session.last_cycle_at)).toISOString() : null, nextCycleAt: session.next_cycle_at ? new Date(String(session.next_cycle_at)).toISOString() : null, cyclesToday: num(session.cycles_today) },
       account: { initialBankUsdt, cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null), equityUsdt: finalEquity, aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd) },
       performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt: daily?.net_pnl_usdt === null || daily?.net_pnl_usdt === undefined ? realizedPnlUsdt + unrealizedPnlUsdt : num(daily.net_pnl_usdt), returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },

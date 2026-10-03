@@ -6,7 +6,7 @@ O teste opera exclusivamente a Spot Testnet, com a banca conceitual registrada n
 
 1. Deixe o notebook na tomada e desative suspensão/hibernação.
 2. Confirme que Docker está em execução: `docker compose ps`.
-3. Confira `.env`: `BINANCE_ENV=testnet`, credenciais Testnet/OpenRouter válidas, `TRADING_LOOP_ENABLED=false` e `TRADING_INTERVAL_SECONDS=600`.
+3. Confira `.env`: `BINANCE_ENV=testnet`, credenciais Testnet/OpenRouter válidas e `TRADING_LOOP_ENABLED=false`. O intervalo e a janela são lidos do PostgreSQL.
 4. Suba ou atualize os serviços sem habilitar o loop: `docker compose up -d --build`.
 5. Valide: `curl http://localhost:3000/health` e `curl http://localhost:3000/status`.
 

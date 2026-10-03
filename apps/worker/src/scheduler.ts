@@ -1,4 +1,4 @@
-import { config, localTime, sessionSchedule, type SessionPhase } from '@bolinha/core';
+import { defaultTradingConfiguration, localTime, sessionSchedule, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
 import { closeRetryDelayMs } from './lifecycle.js';
 
 const reconciliationInitialDelayMs = 30_000;
@@ -22,9 +22,11 @@ const atLocalSecond = (at: Date, targetSeconds: number, nextDay = false) => {
  * a cycle. A slow cycle skips to the next expected slot, avoiding drift and an
  * unnecessary full-interval wait.
  */
-export const nextCycleAt = (phase: SessionPhase, at = new Date()) => {
-  const schedule = sessionSchedule();
-  const currentSeconds = secondsAt(localTime(at));
+export const nextCycleAt = (phase: SessionPhase, configurationOrAt: TradingConfiguration | Date = defaultTradingConfiguration, maybeAt = new Date()) => {
+  const configuration = configurationOrAt instanceof Date ? defaultTradingConfiguration : configurationOrAt;
+  const at = configurationOrAt instanceof Date ? configurationOrAt : maybeAt;
+  const schedule = sessionSchedule(configuration);
+  const currentSeconds = secondsAt(localTime(at, schedule.timezone));
   const startSeconds = secondsAt(schedule.start);
   const stopSeconds = secondsAt(schedule.stopNewPositions);
   const forceSeconds = secondsAt(schedule.forceClose);
@@ -39,7 +41,7 @@ export const nextCycleAt = (phase: SessionPhase, at = new Date()) => {
     return retry < end ? retry : end;
   }
 
-  const intervalSeconds = config.TRADING_INTERVAL_SECONDS;
+  const intervalSeconds = schedule.intervalSeconds;
   const elapsed = Math.max(0, currentSeconds - startSeconds);
   const nextSlotSeconds = startSeconds + (Math.floor(elapsed / intervalSeconds) + 1) * intervalSeconds;
   const boundarySeconds = phase === 'TRADING' ? stopSeconds : forceSeconds;
