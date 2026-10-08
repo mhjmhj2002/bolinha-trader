@@ -25,17 +25,22 @@ describe('Binance fill preservation', () => {
   it('loads myTrades fills during reconciliation because GET order omits them', async () => {
     const urls: string[] = [];
     const client = new BinanceTestnetClient('key', 'secret', 'BTCUSDT', async (url) => {
-      urls.push(String(url));
-      // This mirrors GET /api/v3/order: it provides updateTime/time, not the
-      // transactTime supplied by a POST order response.
-      const body = urls.length === 1 ? { ...filledOrder, transactTime: undefined, updateTime: 1_700_000_000_123, time: 1_700_000_000_000 } : [
-        { price: '100000', qty: '0.00007000', commission: '0.001', commissionAsset: 'BNB', id: 44 },
-      ];
-      return new Response(JSON.stringify(body), { status: 200 });
+      const urlStr = String(url);
+      urls.push(urlStr);
+      if (urlStr.includes('/api/v3/time')) {
+        return new Response(JSON.stringify({ serverTime: 1_700_000_000_000 }), { status: 200 });
+      }
+      if (urlStr.includes('/api/v3/myTrades')) {
+        return new Response(JSON.stringify([
+          { price: '100000', qty: '0.00007000', commission: '0.001', commissionAsset: 'BNB', id: 44 },
+        ]), { status: 200 });
+      }
+      // GET /api/v3/order
+      return new Response(JSON.stringify({ ...filledOrder, transactTime: undefined, updateTime: 1_700_000_000_123, time: 1_700_000_000_000 }), { status: 200 });
     });
     const order = await client.orderByClientId('client-id');
-    expect(urls).toHaveLength(2);
-    expect(urls[1]).toContain('/api/v3/myTrades');
+    expect(urls.filter((u) => !u.includes('/api/v3/time'))).toHaveLength(2);
+    expect(urls.some((u) => u.includes('/api/v3/myTrades'))).toBe(true);
     expect(order?.fills).toEqual([{ price: 100000, qty: 0.00007, commission: 0.001, commissionAsset: 'BNB', tradeId: '44' }]);
     expect(order?.transactTime.toISOString()).toBe('2023-11-14T22:13:20.123Z');
     expect(Number.isNaN(order?.transactTime.getTime() ?? NaN)).toBe(false);

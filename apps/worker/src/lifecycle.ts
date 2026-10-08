@@ -20,10 +20,11 @@ export async function finishDailyIfPositionClosed(
   repo: DailyRepository,
   exchange: Pick<BinanceGateway, 'price'>,
   at: Date,
+  force = false,
 ): Promise<boolean> {
   if (await repo.openPosition()) return false;
   const existing = await repo.dailyResult();
-  if (existing) { await repo.markDailyResultOk?.(at); return true; }
+  if (existing && !force) { await repo.markDailyResultOk?.(at); return true; }
   await repo.markDailyResultPending?.(at);
   const emit = async (level: string, type: string, message: string, payload?: unknown) => {
     if (repo.eventOnceForSession) await repo.eventOnceForSession(level, type, message, at, payload);

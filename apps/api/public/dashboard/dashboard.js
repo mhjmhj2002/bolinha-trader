@@ -6,7 +6,7 @@
   const timezone = () => data?.schedule?.timezone || data?.timezone || 'UTC';
   const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: timezone() }).format(new Date());
   const number = (value, digits = 2) => value === null || value === undefined ? '—' : Number(value).toLocaleString('pt-BR', { minimumFractionDigits: digits, maximumFractionDigits: digits });
-  const money = (value, currency = 'USDT') => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '' : '-'}${currency === 'US$' ? 'US$ ' : ''}${number(Math.abs(value))}${currency === 'USDT' ? ' USDT' : ''}`;
+  const money = (value, currency = 'USDT', digits = 2) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '' : '-'}${currency === 'US$' ? 'US$ ' : ''}${number(Math.abs(value), digits)}${currency === 'USDT' ? ' USDT' : ''}`;
   const signedMoney = (value) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '+' : '-'}${number(Math.abs(value))} USDT`;
   const time = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(iso)) : '—';
   const dateTime = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), dateStyle: 'short', timeStyle: 'short' }).format(new Date(iso)) : '—';
@@ -43,7 +43,7 @@
     $('metric-position').textContent = position ? `${position.symbol} ${number(position.quantity, 8)}` : 'SEM POSIÇÃO';
     $('metric-position-detail').textContent = position ? `Custo: ${money(position.costUsdt)}` : '—';
     $('metric-trades').textContent = String(trades.length);
-    $('metric-ai-cost').textContent = money(account.aiCostUsd, 'US$');
+    $('metric-ai-cost').textContent = money(account.aiCostUsd, 'US$', 4);
     $('metric-tokens').textContent = `${number(aiUsage.totalTokens, 0)} tokens`;
     $('metric-errors').textContent = String(eventCounts.errors);
     $('metric-errors').className = `metric-value ${eventCounts.errors ? 'text-danger' : 'text-success'}`;

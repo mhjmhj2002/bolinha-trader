@@ -3,10 +3,10 @@ import { nextCycleAt, reconciliationRetryDelay } from '../apps/worker/src/schedu
 
 describe('worker scheduler', () => {
   it('uses stable wall-clock slots and skips a delayed slot without a full extra interval', () => {
-    expect(nextCycleAt('TRADING', new Date('2026-10-01T12:00:03Z')).toISOString()).toBe('2026-10-01T12:10:00.000Z');
-    // A cycle that ends at 09:11 São Paulo resumes at the 09:20 expected slot,
-    // not at 09:21 after another full ten-minute interval.
-    expect(nextCycleAt('TRADING', new Date('2026-10-01T12:11:00Z')).toISOString()).toBe('2026-10-01T12:20:00.000Z');
+    expect(nextCycleAt('TRADING', new Date('2026-10-01T12:00:03Z')).toISOString()).toBe('2026-10-01T12:03:00.000Z');
+    // A cycle that ends at 09:04 São Paulo resumes at the 09:06 expected slot,
+    // not at 09:07 after another full three-minute interval.
+    expect(nextCycleAt('TRADING', new Date('2026-10-01T12:04:00Z')).toISOString()).toBe('2026-10-01T12:06:00.000Z');
   });
 
   it('caps a normal cycle at the next session boundary', () => {

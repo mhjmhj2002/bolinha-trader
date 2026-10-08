@@ -16,12 +16,16 @@ export class TradingService {
       config.BINANCE_API_KEY,
       config.BINANCE_API_SECRET,
       config.SYMBOL,
+      undefined,
+      config.BINANCE_RECV_WINDOW_MS,
     ),
     private ai = new OpenRouterClient(
       config.OPENROUTER_API_KEY,
       config.OPENROUTER_MODELS.split(',')
         .map((x) => x.trim())
         .filter(Boolean),
+      undefined,
+      config.OPENROUTER_TIMEOUT_MS,
     ),
   ) {}
 
@@ -231,6 +235,18 @@ export class TradingService {
           clientOrderId,
           error: message,
         });
+        // Se a Binance rejeitou a ordem com erro 400 (ex: recvWindow -1021 ou validação) e comprovadamente
+        // a ordem nunca foi registrada (orderByClientId retornou null), marcamos como REJECTED
+        // para não travar os ciclos subsequentes em PENDING.
+        const isBinanceRejection = message.includes('Binance Testnet HTTP 400') || message.includes('Binance public HTTP 400');
+        if (isBinanceRejection) {
+          await this.repo.markOrderRejected(orderId, `Binance rejected order submission: ${message}`);
+          await this.event('WARN', 'pending_order_reconciled', 'Pending order marked as rejected after Binance rejected submission and confirmed no order exists', {
+            clientOrderId,
+            outcome: 'REJECTED',
+            reason: message,
+          });
+        }
         throw error;
       }
     }
@@ -256,10 +272,15 @@ export class TradingService {
       await this.event('WARN', 'cycle_skipped', 'Trading cycle blocked pending reconciliation', { reason: ready.reason });
       return { action: 'HOLD' as const, reason: ready.reason };
     }
-    const phase = sessionPhase(at, configuration, Boolean(await this.repo.openPosition()));
+    const hasPosition = Boolean(await this.repo.openPosition());
+    const phase = sessionPhase(at, configuration, hasPosition);
     if (phase === 'BEFORE_START' || phase === 'FINISHED') {
       await this.event('INFO', 'cycle_skipped', 'Trading cycle skipped outside the daily session', { phase });
       return { action: 'HOLD' as const, reason: `Session phase is ${phase}` };
+    }
+    if (phase === 'NO_NEW_POSITIONS' && !hasPosition) {
+      await this.event('INFO', 'cycle_skipped', 'Trading cycle skipped during no-new-positions window without an open position', { phase });
+      return { action: 'HOLD' as const, reason: `Session phase is ${phase} and there is no open position` };
     }
     if (phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING') return this.forceClosePositionLocked(configuration);
     await this.event('INFO', 'cycle_started', 'Trading cycle started', { symbol: config.SYMBOL });

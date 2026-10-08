@@ -9,8 +9,11 @@ const configSchema = z.object({
   DATABASE_URL: z.string().url().default('postgres://bolinha:bolinha@localhost:5432/bolinha'),
   API_HOST: z.string().default('127.0.0.1'), API_PORT: numeric(3000),
   BINANCE_ENV: z.literal('testnet').default('testnet'), BINANCE_API_KEY: z.string().default(''), BINANCE_API_SECRET: z.string().default(''),
+  BINANCE_RECV_WINDOW_MS: numeric(60_000),
   OPENROUTER_API_KEY: z.string().default(''),
-  OPENROUTER_MODELS: z.string().default('poolside/laguna-s-2.1:free,qwen/qwen3.8-27b:free,google/gemma-4-31b-it:free,openrouter/free'),
+  OPENROUTER_MODELS: z.string().default('google/gemini-2.0-flash-exp:free,meta-llama/llama-3.3-70b-instruct:free,mistralai/mistral-small-24b-instruct-2501:free,qwen/qwen3.8-27b:free,openrouter/free'),
+  OPENROUTER_TIMEOUT_MS: numeric(30_000),
+  INTERVAL_SECONDS: numeric(180),
   SYMBOL: z.literal('BTCUSDT').default('BTCUSDT'), TRADING_LOOP_ENABLED: bool,
 });
 export type Config = z.infer<typeof configSchema>;
@@ -32,7 +35,7 @@ export interface TradingConfiguration extends SessionSchedule { initialBankUsdt:
 /** Bootstrap values only. Runtime operational behaviour must use PostgreSQL. */
 export const defaultTradingConfiguration: TradingConfiguration = Object.freeze({
   timezone: 'America/Sao_Paulo', start: '09:00', stopNewPositions: '17:50', forceClose: '17:55', end: '18:00',
-  intervalSeconds: 600, initialBankUsdt: 20, maxPositionPercent: 100,
+  intervalSeconds: config.INTERVAL_SECONDS, initialBankUsdt: 20, maxPositionPercent: 100,
 });
 export const sessionSchedule = (configuration: Pick<TradingConfiguration, 'timezone' | 'start' | 'stopNewPositions' | 'forceClose' | 'end' | 'intervalSeconds'> = defaultTradingConfiguration): SessionSchedule => ({ ...configuration });
 const timeValue = /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;

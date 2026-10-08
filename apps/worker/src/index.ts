@@ -7,7 +7,7 @@ import { nextCycleAt, reconciliationRetryDelay } from './scheduler.js';
 
 const repo = new TradingRepository();
 const service = new TradingService(repo);
-const exchange = new BinanceTestnetClient(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, config.SYMBOL);
+const exchange = new BinanceTestnetClient(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, config.SYMBOL, undefined, config.BINANCE_RECV_WINDOW_MS);
 let stopped = false;
 let timer: NodeJS.Timeout | undefined;
 let startupReconciled = false;
@@ -70,9 +70,12 @@ async function tick() {
       const scheduledAt = startupReconciled
         ? consolidationRetry ? new Date(Date.now() + 30_000) : nextCycleAt(phase ?? 'FORCE_CLOSE_PENDING', operationalConfiguration, new Date())
         : new Date(Date.now() + reconciliationRetryDelay(reconciliationAttempts));
+      const delayMs = phase === 'BEFORE_START'
+        ? Math.min(15_000, Math.max(0, scheduledAt.getTime() - Date.now()))
+        : Math.max(0, scheduledAt.getTime() - Date.now());
       timer = setTimeout(
         () => void tick(),
-        Math.max(0, scheduledAt.getTime() - Date.now()),
+        delayMs,
       );
     }
   }

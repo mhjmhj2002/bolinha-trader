@@ -87,4 +87,45 @@ describe('one trading cycle', () => {
     expect(result).toMatchObject({ action: 'HOLD', reason: 'No open conceptual position' });
     expect(events).toEqual(['force_close_noop']);
   });
+
+  it('marks pending order as REJECTED when Binance rejects submission with HTTP 400 and order does not exist', async () => {
+    let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 7, quantity: 0.00024, entryPrice: 82941.72, costUsdt: 19.906, openedAt: new Date() };
+    let orderStatus = '';
+    let rejectedReason = '';
+    const events: string[] = [];
+    const repo = {
+      ensureAccount: async () => {},
+      heartbeat: async () => {},
+      event: async (_severity: string, type: string) => { events.push(type); },
+      account: async () => ({ initialBankUsdt: 20, cashUsdt: 0.1, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => position,
+      pendingOrder: async () => orderStatus === 'PENDING',
+      pendingOrderDetails: async () => null,
+      createPendingOrder: async () => {
+        orderStatus = 'PENDING';
+        return 17;
+      },
+      markOrderRejected: async (_id: number, reason: string) => {
+        orderStatus = 'REJECTED';
+        rejectedReason = reason;
+      },
+      recordExecution: async () => { position = null; },
+    };
+    const exchange = {
+      rules: async () => ({ minNotional: 10, minQty: 0.00001, stepSize: 0.00001 }),
+      price: async () => 82900,
+      placeMarketOrder: async () => {
+        throw new Error('Binance Testnet HTTP 400 (-1021): Timestamp for this request is outside of the recvWindow.');
+      },
+      orderByClientId: async () => null,
+    };
+
+    const service = new TradingService(repo as never, exchange as never, {} as never);
+    await expect(service.forceClosePosition()).rejects.toThrow('Timestamp for this request is outside of the recvWindow');
+
+    expect(orderStatus).toBe('REJECTED');
+    expect(rejectedReason).toContain('Binance Testnet HTTP 400 (-1021)');
+    expect(position).not.toBeNull(); // A posição permanece aberta para tentar no próximo ciclo
+    expect(events).toContain('pending_order_reconciled');
+  });
 });

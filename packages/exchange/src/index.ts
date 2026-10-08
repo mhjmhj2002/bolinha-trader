@@ -33,27 +33,78 @@ const PUBLIC = 'https://api.binance.com';
 const TESTNET = 'https://testnet.binance.vision';
 export class BinanceTestnetClient implements BinanceGateway {
   private rulesCache: SymbolRules | null = null;
+  private timeOffset: number | null = null;
+  private lastTimeSync = 0;
+
   constructor(
     private apiKey: string,
     private secret: string,
     private symbol = 'BTCUSDT',
     private fetchFn: typeof fetch = fetch,
+    private recvWindowMs = 60_000,
   ) {}
+
   private async publicJson(path: string): Promise<any> {
     const r = await this.fetchFn(`${PUBLIC}${path}`, { signal: AbortSignal.timeout(12_000) });
     if (!r.ok) throw new Error(`Binance public HTTP ${r.status}`);
     return r.json();
   }
+
   private async testnetJson(path: string): Promise<any> {
     const r = await this.fetchFn(`${TESTNET}${path}`, { signal: AbortSignal.timeout(12_000) });
     if (!r.ok) throw new Error(`Binance Testnet HTTP ${r.status}`);
     return r.json();
   }
-  private async signed(path: string, params: URLSearchParams, method: 'GET' | 'POST' = 'GET'): Promise<any> {
+
+  async syncTimeOffset(force = false): Promise<number> {
+    const now = Date.now();
+    // Cache offset por até 10 minutos a menos que forçado
+    if (!force && this.timeOffset !== null && now - this.lastTimeSync < 600_000) {
+      return this.timeOffset;
+    }
+    try {
+      const t0 = Date.now();
+      const r = await this.fetchFn(`${TESTNET}/api/v3/time`, { signal: AbortSignal.timeout(12_000) });
+      const t1 = Date.now();
+      if (r && r.ok) {
+        const data = await r.clone().json().catch(() => null);
+        const serverTime = Number(data?.serverTime);
+        if (Number.isFinite(serverTime) && serverTime > 0) {
+          const estimatedLocalTime = Math.round((t0 + t1) / 2);
+          this.timeOffset = serverTime - estimatedLocalTime;
+          this.lastTimeSync = Date.now();
+          return this.timeOffset;
+        }
+      }
+    } catch {
+      // Ignora falha em mocks ou rede, mantendo timeOffset = 0
+    }
+    this.timeOffset = 0;
+    this.lastTimeSync = Date.now();
+    return this.timeOffset;
+  }
+
+  getTimeOffset(): number | null {
+    return this.timeOffset;
+  }
+
+  private async executeSigned(path: string, params: URLSearchParams, method: 'GET' | 'POST'): Promise<any> {
     if (!this.apiKey || !this.secret)
       throw new Error('Binance Testnet credentials are required for execution');
-    params.set('timestamp', String(Date.now()));
-    params.set('recvWindow', '5000');
+
+    // Assegura sincronização de relógio se ainda não sincronizado
+    if (this.timeOffset === null) {
+      try {
+        await this.syncTimeOffset();
+      } catch {
+        // Fallback defensivo para offset 0 se falhar a chamada de tempo
+        this.timeOffset = 0;
+      }
+    }
+
+    const effectiveTime = Date.now() + (this.timeOffset ?? 0);
+    params.set('timestamp', String(effectiveTime));
+    params.set('recvWindow', String(this.recvWindowMs));
     const sig = createHmac('sha256', this.secret).update(params.toString()).digest('hex');
     const r = await this.fetchFn(`${TESTNET}${path}?${params}&signature=${sig}`, {
       method,
@@ -62,11 +113,33 @@ export class BinanceTestnetClient implements BinanceGateway {
     });
     if (!r.ok) {
       const body = (await r.json().catch(() => null)) as { code?: number; msg?: string } | null;
-      throw new Error(
+      const error = new Error(
         `Binance Testnet HTTP ${r.status}${body?.code !== undefined ? ` (${body.code})` : ''}${body?.msg ? `: ${body.msg}` : ''}`,
-      );
+      ) as Error & { code?: number };
+      if (body?.code !== undefined) {
+        error.code = body.code;
+      }
+      throw error;
     }
     return r.json();
+  }
+
+  private async signed(path: string, params: URLSearchParams, method: 'GET' | 'POST' = 'GET'): Promise<any> {
+    try {
+      return await this.executeSigned(path, new URLSearchParams(params), method);
+    } catch (error) {
+      // Se ocorrer erro -1021 (timestamp outside recvWindow), invalida offset, ressincroniza e tenta 1 vez
+      const isRecvWindowError =
+        (error instanceof Error && error.message.includes('(-1021)')) ||
+        (typeof error === 'object' && error !== null && 'code' in error && (error as { code: number }).code === -1021);
+
+      if (isRecvWindowError) {
+        this.timeOffset = null;
+        await this.syncTimeOffset(true);
+        return await this.executeSigned(path, new URLSearchParams(params), method);
+      }
+      throw error;
+    }
   }
   async candles(interval: '1m' | '5m' | '15m', limit = 100): Promise<Candle[]> {
     const rows = await this.publicJson(

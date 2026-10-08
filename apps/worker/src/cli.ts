@@ -24,8 +24,8 @@ else if (command === 'finalize-today') {
   if (state && String(state.phase) !== 'FINISHED' && sessionPhase(new Date(), operational) === 'FINISHED' && !position)
     state = await repo.markSessionFinishedAtScheduledEnd(new Date(), operational);
   if (!state || String(state.phase) !== 'FINISHED') throw new Error('Finalize requires a FINISHED trading session');
-  const exchange = new BinanceTestnetClient(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, config.SYMBOL);
-  const finalized = await finishDailyIfPositionClosed(repo, exchange, new Date());
+  const exchange = new BinanceTestnetClient(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, config.SYMBOL, undefined, config.BINANCE_RECV_WINDOW_MS);
+  const finalized = await finishDailyIfPositionClosed(repo, exchange, new Date(), true);
   if (!finalized) throw new Error('Finalize refused: a conceptual position remains open');
   console.log(JSON.stringify({ sessionDay: sessionDay(new Date(), operational.timezone), dailyResultStatus: await repo.dailyResultStatus(), finalized }, null, 2));
 }

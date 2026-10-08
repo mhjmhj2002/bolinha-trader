@@ -208,9 +208,11 @@ export class TradingRepository {
       // A BEFORE_START row is only a planning marker, not historical
       // evidence yet. Keep it aligned with a safe edit so the next session is
       // stamped with the configuration the worker will actually use.
+      // Keep the current day's session aligned with the updated configuration
+      // so the session timeline and worker reflect the active parameters.
       await connection.query(
         `update trading_sessions set timezone=$1,start_time=$2::time,stop_new_positions_time=$3::time,force_close_time=$4::time,end_time=$5::time,
-         interval_seconds=$6,configuration_version_id=$7,updated_at=$8 where session_day=$9 and phase='BEFORE_START' and started_at is null`,
+         interval_seconds=$6,configuration_version_id=$7,updated_at=$8 where session_day=$9`,
         [next.timezone, next.start, next.stopNewPositions, next.forceClose, next.end, next.intervalSeconds, version.rows[0].id, at, sessionDay(at, current.timezone)],
       );
       await connection.query('insert into system_events(level,event,message,payload,created_at) values($1,$2,$3,$4::jsonb,$5)', [
@@ -687,12 +689,12 @@ export class TradingRepository {
     if (await this.openPosition())
       throw new Error('Daily result cannot be consolidated while a conceptual position is open');
     const schedule = sessionSchedule(this.configurationForSession(session, configuration));
-    const finishedAt = session.finished_at
-      ? new Date(String(session.finished_at))
-      : (await this.client.query<{ at: Date }>(
-        "select (($1::date + $2::time) at time zone $3) as at",
-        [day, schedule.end, schedule.timezone],
-      )).rows[0].at;
+    const scheduledEnd = (await this.client.query<{ at: Date }>(
+      "select (($1::date + $2::time) at time zone $3) as at",
+      [day, schedule.end, schedule.timezone],
+    )).rows[0].at;
+    const sessionFinishedAt = session.finished_at ? new Date(String(session.finished_at)) : scheduledEnd;
+    const finishedAt = new Date(Math.max(sessionFinishedAt.getTime(), at.getTime()));
     const startedAt = session.started_at ? new Date(String(session.started_at)) : finishedAt;
     const performance = await this.performance(price);
     const initialEquityUsdt = session?.initial_equity_usdt === null || session?.initial_equity_usdt === undefined
@@ -977,20 +979,39 @@ export class TradingRepository {
     const models = usageResult.rows.map((row) => ({ model: String(row.model), calls: num(row.calls), promptTokens: num(row.prompt_tokens), completionTokens: num(row.completion_tokens), totalTokens: num(row.total_tokens), costUsd: num(row.cost_usd) }));
     const fallbackCount = eventsResult.rows.filter((row) => String(row.event) === 'ai_fallback').length;
     const errorCount = eventsResult.rows.filter((row) => String(row.level) === 'ERROR').length;
-    const finalEquity = daily?.final_equity_usdt === null || daily?.final_equity_usdt === undefined ? latest?.equityUsdt ?? null : num(daily.final_equity_usdt);
-    const realizedPnlUsdt = daily?.realized_pnl_usdt === null || daily?.realized_pnl_usdt === undefined ? latest?.realizedPnlUsdt ?? 0 : num(daily.realized_pnl_usdt);
-    const unrealizedPnlUsdt = daily?.unrealized_pnl_usdt === null || daily?.unrealized_pnl_usdt === undefined ? latest?.unrealizedPnlUsdt ?? 0 : num(daily.unrealized_pnl_usdt);
+    const liveToday = day === sessionDay();
+    const finalEquity = liveToday && latest
+      ? latest.equityUsdt
+      : daily?.final_equity_usdt === null || daily?.final_equity_usdt === undefined
+        ? latest?.equityUsdt ?? null
+        : num(daily.final_equity_usdt);
+    const dailyTradesRealizedPnl = tradesResult.rows
+      .filter((row) => row.side === 'SELL')
+      .reduce((sum, row) => sum + num(row.net_pnl_usdt), 0);
+    const realizedPnlUsdt = daily?.realized_pnl_usdt !== null && daily?.realized_pnl_usdt !== undefined
+      ? num(daily.realized_pnl_usdt)
+      : dailyTradesRealizedPnl;
+    const unrealizedPnlUsdt = latest && latest.positionQuantity && latest.positionCostUsdt
+      ? latest.positionQuantity * latest.price - latest.positionCostUsdt
+      : (daily?.unrealized_pnl_usdt !== null && daily?.unrealized_pnl_usdt !== undefined ? num(daily.unrealized_pnl_usdt) : 0);
+    const netPnlUsdt = daily?.net_pnl_usdt !== null && daily?.net_pnl_usdt !== undefined
+      ? num(daily.net_pnl_usdt)
+      : (initialBankUsdt !== null && finalEquity !== null ? finalEquity - initialBankUsdt : realizedPnlUsdt + unrealizedPnlUsdt);
     return {
       schedule: { timezone: schedule.timezone, startTime: schedule.start, stopNewPositionsTime: schedule.stopNewPositions, forceCloseTime: schedule.forceClose, endTime: schedule.end, intervalSeconds: schedule.intervalSeconds },
       session: session && { day, phase: String(session.phase), timezone: String(session.timezone), startedAt: session.started_at ? new Date(String(session.started_at)).toISOString() : null, finishedAt: session.finished_at ? new Date(String(session.finished_at)).toISOString() : null, lastCycleAt: session.last_cycle_at ? new Date(String(session.last_cycle_at)).toISOString() : null, nextCycleAt: session.next_cycle_at ? new Date(String(session.next_cycle_at)).toISOString() : null, cyclesToday: num(session.cycles_today) },
       account: { initialBankUsdt, cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null), equityUsdt: finalEquity, aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd) },
-      performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt: daily?.net_pnl_usdt === null || daily?.net_pnl_usdt === undefined ? realizedPnlUsdt + unrealizedPnlUsdt : num(daily.net_pnl_usdt), returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
+      performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt, returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
       position: latest?.positionQuantity ? { symbol: config.SYMBOL.replace('USDT', ''), quantity: latest.positionQuantity, costUsdt: latest.positionCostUsdt, price: latest.price } : null,
       decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), binanceOrderId: row.binance_order_id })),
       aiUsage: { models, fallbacks: fallbackCount, totalTokens: models.reduce((total, model) => total + model.totalTokens, 0), totalCostUsd: models.reduce((total, model) => total + model.costUsd, 0) },
       events: eventsResult.rows.map((row) => ({ level: row.level, event: row.event, message: row.message, at: new Date(String(row.created_at)).toISOString() })),
       equityHistory: snapshots.map(({ at, cashUsdt, equityUsdt }) => ({ at, cashUsdt, equityUsdt })),
-      pnlHistory: snapshots.map(({ at, realizedPnlUsdt: realized, netPnlUsdt: total }) => ({ at, realizedPnlUsdt: realized, totalPnlUsdt: total })),
+      pnlHistory: snapshots.map(({ at, equityUsdt, realizedPnlUsdt: r, netPnlUsdt: t }) => {
+        if (daily?.net_pnl_usdt !== null && daily?.net_pnl_usdt !== undefined) return { at, realizedPnlUsdt: r, totalPnlUsdt: t };
+        const totalPnl = initialBankUsdt !== null ? equityUsdt - initialBankUsdt : t;
+        return { at, realizedPnlUsdt: totalPnl, totalPnlUsdt: totalPnl };
+      }),
       summary: daily && { final: daily.final_equity_usdt !== null && daily.final_equity_usdt !== undefined, tradeCount: num(daily.trade_count), buyCount: num(daily.buy_count), sellCount: num(daily.sell_count), holdCount: num(daily.hold_count), rejectedDecisionCount: num(daily.rejected_decision_count), feesUsdtKnown: num(daily.fees_usdt_known), fallbackCount: num(daily.fallback_count), errorCount: num(daily.error_count), forceCloseOccurred: Boolean(daily.forced_close_occurred), openPosition: false },
       eventCounts: { errors: errorCount },
     };
