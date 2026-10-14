@@ -25,7 +25,7 @@ describe('one trading cycle', () => {
     expect(submitted).toBe(1);
   });
 
-  it('a normal AI SELL ignores a partial amount and persists exactly the quantity sent to Binance', async () => {
+  it('a normal AI SELL ignores a partial amount and persists exactly the quantity sent to B3', async () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .0015, entryPrice: 10_000, costUsdt: 15, openedAt: new Date() };
     const sent: number[] = [];
     const recorded: number[] = [];
@@ -39,15 +39,15 @@ describe('one trading cycle', () => {
     expect(position).toBeNull();
   });
 
-  it('retries the same pending SELL after 17:55 and only closes after Binance confirms it', async () => {
+  it('retries the same pending SELL after 17:55 and only closes after B3 confirms it', async () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .001, entryPrice: 10_000, costUsdt: 10, openedAt: new Date() };
     let pending: { id: number; clientOrderId: string; side: 'SELL'; requestedAmount: number; requestedQuantity: number } | null = null;
     const clientIds: string[] = [];
     let attempts = 0;
     const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => Boolean(pending), pendingOrderDetails: async () => pending, createPendingOrder: async (clientOrderId: string, side: 'SELL', amount: number, quantity: number) => { pending = { id: 1, clientOrderId, side, requestedAmount: amount, requestedQuantity: quantity }; return 1; }, markOrderRejected: async () => {}, recordExecution: async () => { position = null; pending = null; } };
-    const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async (_side: string, quantity: number, clientOrderId: string) => { clientIds.push(clientOrderId); attempts++; if (attempts === 1) throw new Error('temporary Binance outage'); return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: quantity, cummulativeQuoteQty: quantity * 10_000, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
+    const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async (_side: string, quantity: number, clientOrderId: string) => { clientIds.push(clientOrderId); attempts++; if (attempts === 1) throw new Error('temporary B3 outage'); return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: quantity, cummulativeQuoteQty: quantity * 10_000, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
     const service = new TradingService(repo as never, exchange as never, {} as never);
-    await expect(service.runOnce(new Date('2026-10-01T20:59:00Z'))).rejects.toThrow('temporary Binance outage');
+    await expect(service.runOnce(new Date('2026-10-01T20:59:00Z'))).rejects.toThrow('temporary B3 outage');
     expect(position).not.toBeNull();
     await service.runOnce(new Date('2026-10-01T21:03:00Z'));
     expect(position).toBeNull();
@@ -88,7 +88,7 @@ describe('one trading cycle', () => {
     expect(events).toEqual(['force_close_noop']);
   });
 
-  it('marks pending order as REJECTED when Binance rejects submission with HTTP 400 and order does not exist', async () => {
+  it('marks pending order as REJECTED when B3 rejects submission with HTTP 400 and order does not exist', async () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 7, quantity: 0.00024, entryPrice: 82941.72, costUsdt: 19.906, openedAt: new Date() };
     let orderStatus = '';
     let rejectedReason = '';
@@ -115,7 +115,7 @@ describe('one trading cycle', () => {
       rules: async () => ({ minNotional: 10, minQty: 0.00001, stepSize: 0.00001 }),
       price: async () => 82900,
       placeMarketOrder: async () => {
-        throw new Error('Binance Testnet HTTP 400 (-1021): Timestamp for this request is outside of the recvWindow.');
+        throw new Error('B3 Testnet HTTP 400 (-1021): Timestamp for this request is outside of the recvWindow.');
       },
       orderByClientId: async () => null,
     };
@@ -124,8 +124,99 @@ describe('one trading cycle', () => {
     await expect(service.forceClosePosition()).rejects.toThrow('Timestamp for this request is outside of the recvWindow');
 
     expect(orderStatus).toBe('REJECTED');
-    expect(rejectedReason).toContain('Binance Testnet HTTP 400 (-1021)');
+    expect(rejectedReason).toContain('B3 Testnet HTTP 400 (-1021)');
     expect(position).not.toBeNull(); // A posição permanece aberta para tentar no próximo ciclo
     expect(events).toContain('pending_order_reconciled');
+  });
+
+  it('marks pending order as REJECTED when submission fails with network error (fetch failed) and B3 confirms order does not exist', async () => {
+    let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 7, quantity: 0.00024, entryPrice: 82941.72, costUsdt: 19.906, openedAt: new Date() };
+    let orderStatus = '';
+    let rejectedReason = '';
+    const events: string[] = [];
+    const repo = {
+      ensureAccount: async () => {},
+      heartbeat: async () => {},
+      event: async (_severity: string, type: string) => { events.push(type); },
+      account: async () => ({ initialBankUsdt: 20, cashUsdt: 0.1, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => position,
+      pendingOrder: async () => orderStatus === 'PENDING',
+      pendingOrderDetails: async () => null,
+      createPendingOrder: async () => {
+        orderStatus = 'PENDING';
+        return 19;
+      },
+      markOrderRejected: async (_id: number, reason: string) => {
+        orderStatus = 'REJECTED';
+        rejectedReason = reason;
+      },
+      recordExecution: async () => { position = null; },
+    };
+    const exchange = {
+      rules: async () => ({ minNotional: 10, minQty: 0.00001, stepSize: 0.00001 }),
+      price: async () => 82900,
+      placeMarketOrder: async () => {
+        throw new Error('fetch failed');
+      },
+      orderByClientId: async () => null,
+    };
+
+    const service = new TradingService(repo as never, exchange as never, {} as never);
+    await expect(service.forceClosePosition()).rejects.toThrow('fetch failed');
+
+    expect(orderStatus).toBe('REJECTED');
+    expect(rejectedReason).toContain('fetch failed');
+    expect(events).toContain('pending_order_reconciled');
+  });
+
+  it('automatically triggers runtime reconciliation and unblocks trading cycle when pending orders exist', async () => {
+    let pendingOrdersList = [{ id: 10, clientOrderId: 'pending-network-order', side: 'BUY' as const, requestedQuantity: 0.00024 }];
+    const events: string[] = [];
+    let stateConsistent = false;
+    const repo = {
+      ensureAccount: async () => {},
+      heartbeat: async () => {},
+      event: async (_severity: string, type: string) => { events.push(type); },
+      account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => null,
+      pendingOrder: async () => pendingOrdersList.length > 0,
+      pendingOrders: async () => pendingOrdersList,
+      pendingOrderCount: async () => pendingOrdersList.length,
+      reconciliationState: async () => ({ status: 'OK' as const, stateConsistent: pendingOrdersList.length === 0, lastError: null }),
+      reconciliationStarted: async () => {},
+      reconciliationCompleted: async () => { stateConsistent = true; },
+      reconciliationFailed: async () => {},
+      stateConsistency: async () => ({ consistent: pendingOrdersList.length === 0, reason: null }),
+      saveSnapshot: async () => 1,
+      saveDecision: async () => 1,
+      markOrderRejected: async (id: number) => {
+        pendingOrdersList = pendingOrdersList.filter(o => o.id !== id);
+      },
+      recordExecution: async () => ({ applied: true }),
+    };
+
+    const exchange = {
+      rules: async () => ({ minNotional: 10, minQty: 0.00001, stepSize: 0.00001 }),
+      price: async () => 82900,
+      candles: async () => candles,
+      orderByClientId: async () => null, // B3 confirma que a ordem pendente não existe
+    };
+
+    const ai = {
+      decide: async () => ({
+        decision: { action: 'HOLD' as const, amountUsdt: 0, confidence: 0.9, reason: 'hold test', rawResponse: null },
+        usage: { modelRequested: 'test-model', latencyMs: 50, promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, error: null, fallbackUsed: false },
+      }),
+    };
+
+    const service = new TradingService(repo as never, exchange as never, ai as never);
+    // Força data dentro da sessão de trading
+    const tradingDate = new Date('2026-03-25T14:00:00Z');
+    const result = await service.runOnce(tradingDate);
+
+    expect(pendingOrdersList).toHaveLength(0);
+    expect(stateConsistent).toBe(true);
+    expect(events).toContain('pending_order_reconciled');
+    expect(events).toContain('reconciliation_completed');
   });
 });

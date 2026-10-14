@@ -1,5 +1,5 @@
 import { config, type SessionPhase } from '@bolinha/core';
-import type { BinanceGateway } from '@bolinha/exchange';
+import type { BrokerGateway } from '@bolinha/exchange';
 
 type DailyRepository = {
   openPosition(): Promise<unknown | null>;
@@ -18,7 +18,7 @@ type DailyRepository = {
  */
 export async function finishDailyIfPositionClosed(
   repo: DailyRepository,
-  exchange: Pick<BinanceGateway, 'price'>,
+  exchange: Pick<BrokerGateway, 'price'>,
   at: Date,
   force = false,
 ): Promise<boolean> {

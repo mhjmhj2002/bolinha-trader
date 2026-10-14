@@ -8,7 +8,7 @@ Registrar decisões observáveis no código e suas consequências.
 | --- | --- | --- |
 | Node/TypeScript e pnpm | uma stack tipada para apps e packages | build único por project references |
 | PostgreSQL como ledger | histórico transacional/auditável | conta é conceitual, não saldo da exchange |
-| Binance Spot Testnet | experimentar sem produção | código recusa ambiente produtivo |
+| B3 (paper) | experimentar sem produção | código recusa ambiente produtivo |
 | API e worker separados | observação não deve depender do scheduler | dois processos compartilham banco |
 | Risk Engine determinístico | IA não controla segurança | sugestões podem virar HOLD |
 | uma posição e SELL integral | reduzir complexidade/escopo | sem short, múltiplas posições ou venda parcial |

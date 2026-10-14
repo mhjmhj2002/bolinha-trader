@@ -35,7 +35,7 @@ As tarefas ativas residem na pasta `docs/tasks/`. Cada tarefa possui nomenclatur
 ## 2. Padrões de Qualidade de Código
 
 1. **Fail-Closed e Segurança Financeira**:
-   - O projeto opera ordens em exchange (Binance Testnet). Toda e qualquer incerteza, erro de rede, timeout ou resposta inválida de IA **deve sempre cair em HOLD seguro**.
+   - O projeto opera ordens em exchange (B3 (paper)). Toda e qualquer incerteza, erro de rede, timeout ou resposta inválida de IA **deve sempre cair em HOLD seguro**.
    - Jamais ignore erros de validação financeira ou regras de lote mínimo (`minNotional`, `minQty`, `stepSize`).
 2. **Configurações Centralizadas e Tipadas**:
    - Novas variáveis de ambiente devem ser registradas com schema Zod no pacote `packages/core/src/index.ts` e refletidas em `.env.example` e `.env`.

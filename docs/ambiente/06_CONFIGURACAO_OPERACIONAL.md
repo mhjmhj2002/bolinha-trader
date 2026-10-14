@@ -4,7 +4,7 @@
 
 Separar segredo de parâmetro de trading. Veja [API](12_API_HTTP.md) e [lifecycle](07_TRADING_LIFECYCLE.md).
 
-`.env` contém `DATABASE_URL`, chaves Binance/OpenRouter, `BINANCE_ENV`, host/porta, modelos e kill switch `TRADING_LOOP_ENABLED`. A tabela `trading_configuration` guarda a configuração ativa:
+`.env` contém `DATABASE_URL`, chaves B3/OpenRouter, `(removido)`, host/porta, modelos e kill switch `TRADING_LOOP_ENABLED`. A tabela `trading_configuration` guarda a configuração ativa:
 
 | Campo | Significado |
 | --- | --- |

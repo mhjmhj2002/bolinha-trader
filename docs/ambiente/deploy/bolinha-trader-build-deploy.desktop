@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Bolinha Trader - Build & Deploy
+Comment=Executa Build e Deploy completos do Bolinha Trader mantendo o terminal aberto
+Exec=bash -c 'if [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh"; fi; export PATH="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node" 2>/dev/null | tail -n 1)/bin:/snap/bin:$HOME/.local/bin:$PATH"; /home/mhj/git/bolinha-trader/docs/ambiente/deploy/run-all.sh; echo ""; echo "Pressione ENTER para fechar..."; read -r _'
+Icon=utilities-terminal
+Path=/home/mhj/git/bolinha-trader
+Terminal=true
+Categories=Development;Utility;
+StartupNotify=true

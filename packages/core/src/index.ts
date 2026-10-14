@@ -8,19 +8,15 @@ const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   DATABASE_URL: z.string().url().default('postgres://bolinha:bolinha@localhost:5432/bolinha'),
   API_HOST: z.string().default('127.0.0.1'), API_PORT: numeric(3000),
-  BINANCE_ENV: z.literal('testnet').default('testnet'), BINANCE_API_KEY: z.string().default(''), BINANCE_API_SECRET: z.string().default(''),
-  BINANCE_RECV_WINDOW_MS: numeric(60_000),
   OPENROUTER_API_KEY: z.string().default(''),
   OPENROUTER_MODELS: z.string().default('google/gemini-2.0-flash-exp:free,meta-llama/llama-3.3-70b-instruct:free,mistralai/mistral-small-24b-instruct-2501:free,qwen/qwen3.8-27b:free,openrouter/free'),
   OPENROUTER_TIMEOUT_MS: numeric(30_000),
   INTERVAL_SECONDS: numeric(180),
-  SYMBOL: z.literal('BTCUSDT').default('BTCUSDT'), TRADING_LOOP_ENABLED: bool,
+  SYMBOL: z.string().default('PETR4'), TRADING_LOOP_ENABLED: bool,
 });
 export type Config = z.infer<typeof configSchema>;
 export const config = configSchema.parse(process.env);
-// Deliberate guard: this version has no production Binance endpoint at all.
-if (config.BINANCE_ENV !== 'testnet') throw new Error('BINANCE_ENV must be testnet; production is unsupported');
-export const logger = pino({ level: process.env.LOG_LEVEL ?? 'info', redact: ['BINANCE_API_KEY', 'BINANCE_API_SECRET', 'OPENROUTER_API_KEY', '*.apiKey', '*.secret'] });
+export const logger = pino({ level: process.env.LOG_LEVEL ?? 'info', redact: ['OPENROUTER_API_KEY', '*.apiKey', '*.secret'] });
 
 export type Action = 'BUY' | 'SELL' | 'HOLD';
 export interface Position { quantity: number; entryPrice: number; costUsdt: number; openedAt: Date }
@@ -35,7 +31,7 @@ export interface TradingConfiguration extends SessionSchedule { initialBankUsdt:
 /** Bootstrap values only. Runtime operational behaviour must use PostgreSQL. */
 export const defaultTradingConfiguration: TradingConfiguration = Object.freeze({
   timezone: 'America/Sao_Paulo', start: '09:00', stopNewPositions: '17:50', forceClose: '17:55', end: '18:00',
-  intervalSeconds: config.INTERVAL_SECONDS, initialBankUsdt: 20, maxPositionPercent: 100,
+  intervalSeconds: config.INTERVAL_SECONDS, initialBankUsdt: 100, maxPositionPercent: 100,
 });
 export const sessionSchedule = (configuration: Pick<TradingConfiguration, 'timezone' | 'start' | 'stopNewPositions' | 'forceClose' | 'end' | 'intervalSeconds'> = defaultTradingConfiguration): SessionSchedule => ({ ...configuration });
 const timeValue = /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
@@ -161,7 +157,7 @@ export type DailyDiagnosticCode =
   | 'CYCLE_MISSED'
   | 'CYCLE_DELAYED'
   | 'WORKER_RESTART'
-  | 'BINANCE_ERROR'
+  | 'BROKER_ERROR'
   | 'OPENROUTER_ERROR'
   | 'FALLBACK'
   | 'ORDER_REJECTED'
@@ -209,7 +205,7 @@ export type DailyReportInput = {
     maxCycleGapSeconds: number | null;
     workerRestarts: number;
     errors: number;
-    binanceErrors: number;
+    brokerErrors: number;
     openRouterErrors: number;
     inconsistencies: number;
     reconciliationIssues: number;
@@ -264,8 +260,8 @@ export const buildDailyReport = (input: DailyReportInput): DailyReport => {
     reportDiagnostic(diagnostics, 'CYCLE_DELAYED', 'WARN', `Maior intervalo entre ciclos: ${infrastructure.maxCycleGapSeconds}s.`);
   if (infrastructure.workerRestarts > 0)
     reportDiagnostic(diagnostics, 'WORKER_RESTART', 'WARN', `${infrastructure.workerRestarts} reinício(s) do worker detectado(s).`, infrastructure.workerRestarts);
-  if (infrastructure.binanceErrors > 0)
-    reportDiagnostic(diagnostics, 'BINANCE_ERROR', 'ERROR', `${infrastructure.binanceErrors} erro(s) da Binance.`, infrastructure.binanceErrors);
+  if (infrastructure.brokerErrors > 0)
+    reportDiagnostic(diagnostics, 'BROKER_ERROR', 'ERROR', `${infrastructure.brokerErrors} erro(s) do broker.`, infrastructure.brokerErrors);
   if (infrastructure.openRouterErrors > 0)
     reportDiagnostic(diagnostics, 'OPENROUTER_ERROR', 'WARN', `${infrastructure.openRouterErrors} erro(s) do OpenRouter com HOLD seguro.`, infrastructure.openRouterErrors);
   if (input.ai.fallbacks > 0)

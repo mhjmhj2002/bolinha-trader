@@ -13,7 +13,7 @@ curl http://localhost:3000/status
 open http://localhost:3000/dashboard
 ```
 
-Antes da janela, confirme `.env` com `BINANCE_ENV=testnet`, chaves e `TRADING_LOOP_ENABLED=false`. Para iniciar o loop conscientemente, altere-o para `true` e recrie worker/API: `docker compose up -d --build --force-recreate worker api`. Confira `pnpm trading:day-test:check`.
+Antes da janela, confirme `.env` com `(removido)=testnet`, chaves e `TRADING_LOOP_ENABLED=false`. Para iniciar o loop conscientemente, altere-o para `true` e recrie worker/API: `docker compose up -d --build --force-recreate worker api`. Confira `pnpm trading:day-test:check`.
 
 ### Parar, fechar e recuperar
 

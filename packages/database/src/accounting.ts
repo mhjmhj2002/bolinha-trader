@@ -13,10 +13,10 @@ export type FeeSummary = {
 };
 
 /**
- * Binance reports the asset of every commission.  Keep that unit intact: only
- * USDT commissions can affect a USDT ledger without a historical conversion.
+ * The broker reports the asset of every commission.  Keep that unit intact: only
+ * BRL commissions can affect a BRL ledger without a historical conversion.
  */
-export const summarizeFees = (fills: readonly ExecutionFill[], baseAsset = 'BTC', quoteAsset = 'USDT'): FeeSummary => {
+export const summarizeFees = (fills: readonly ExecutionFill[], baseAsset = '', quoteAsset = 'BRL'): FeeSummary => {
   const byAsset: Record<string, number> = {};
   for (const fill of fills) {
     if (!Number.isFinite(fill.commission) || fill.commission === 0) continue;
@@ -40,11 +40,11 @@ export const executionAccounting = (
   return {
     ...fees,
     // This is the quantity which belongs to (BUY) or is consumed from (SELL)
-    // the conceptual BTC position.  BNB and other third-asset fees never
-    // change either BTC inventory or USDT cash.
+    // the conceptual position.  Other third-asset fees never
+    // change either inventory or BRL cash.
     positionQuantity: side === 'BUY' ? quantity - fees.baseFee : quantity + fees.baseFee,
-    // Effective USDT cost/proceeds. Other assets intentionally have no made-up
-    // USDT valuation.
+    // Effective BRL cost/proceeds. Other assets intentionally have no made-up
+    // BRL valuation.
     effectiveQuoteAmount: side === 'BUY' ? quoteAmount + fees.quoteFee : quoteAmount - fees.quoteFee,
   };
 };

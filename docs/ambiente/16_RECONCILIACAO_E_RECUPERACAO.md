@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-Explicar como o sistema conecta ledger e exchange após incerteza. Veja também [Binance](10_BINANCE_TESTNET.md).
+Explicar como o sistema conecta ledger e exchange após incerteza. Veja também [B3](README.md).
 
 ```mermaid
 flowchart TD
@@ -18,6 +18,6 @@ flowchart TD
   Check -->|inconsistente| Block
 ```
 
-Antes de cada operação o worker exige `reconciliation_state=OK`, estado consistente e nenhuma ordem pendente. Uma ordem é criada localmente como `PENDING` antes do envio e recebe client order ID estável. Após crash depois de BUY/SELL, o startup consulta Binance; FILLED compatível é persistido uma única vez, `-2013` marca ausência da ordem como rejeitada, e qualquer estado ainda ambíguo ou Binance indisponível mantém fail-closed.
+Antes de cada operação o worker exige `reconciliation_state=OK`, estado consistente e nenhuma ordem pendente. Uma ordem é criada localmente como `PENDING` antes do envio e recebe client order ID estável. Após crash depois de BUY/SELL, o startup consulta B3; FILLED compatível é persistido uma única vez, `-2013` marca ausência da ordem como rejeitada, e qualquer estado ainda ambíguo ou B3 indisponível mantém fail-closed.
 
-PostgreSQL é ledger conceitual; Binance é autoridade sobre ordens enviadas. O projeto não usa saldos integrais da conta para “corrigir” o ledger. Repetir execução usa o mesmo client ID quando aplicável, e `recordExecution` é idempotente. Após recuperação, confirme `/health`, `/status`, eventos e posição antes de reativar loop.
+PostgreSQL é ledger conceitual; B3 é autoridade sobre ordens enviadas. O projeto não usa saldos integrais da conta para “corrigir” o ledger. Repetir execução usa o mesmo client ID quando aplicável, e `recordExecution` é idempotente. Após recuperação, confirme `/health`, `/status`, eventos e posição antes de reativar loop.

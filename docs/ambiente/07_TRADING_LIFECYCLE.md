@@ -16,7 +16,7 @@ stateDiagram-v2
   FINISHED --> BEFORE_START: próximo dia
 ```
 
-Em `TRADING`, o worker registra check operacional, executa imediatamente ao entrar na fase e depois usa slots ancorados no início. Busca candles 1m/5m/15m, cria snapshot, consulta IA, aplica risco, persiste decisão e, se necessário, cria ordem `PENDING` antes de chamar a Binance. A confirmação atualiza ordem, fills, trade, posição e conta.
+Em `TRADING`, o worker registra check operacional, executa imediatamente ao entrar na fase e depois usa slots ancorados no início. Busca candles 1m/5m/15m, cria snapshot, consulta IA, aplica risco, persiste decisão e, se necessário, cria ordem `PENDING` antes de chamar a B3. A confirmação atualiza ordem, fills, trade, posição e conta.
 
 Em `NO_NEW_POSITIONS`, BUY vira HOLD e SELL ainda fecha posição. Em `FORCE_CLOSE`, tenta fechar e conta tentativas. Após `endTime`, posição aberta mantém `FORCE_CLOSE_PENDING`, com nova tentativa a cada 30 segundos. `FINISHED` não implica resultado diário: sem posição, gera `daily_results` idempotentemente.
 

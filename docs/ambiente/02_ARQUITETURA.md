@@ -8,9 +8,9 @@ O monorepo pnpm tem `apps/api` (Fastify e dashboard) e `apps/worker` (scheduler 
 
 ```mermaid
 flowchart LR
-  Public[Binance pública\ncandles e preço] --> Worker
+  Public[B3 pública\ncandles e preço] --> Worker
   Worker --> Market[market-data] --> AI[OpenRouter] --> Risk[Risk Engine]
-  Risk -->|ordem autorizada| Testnet[Binance Spot Testnet]
+  Risk -->|ordem autorizada| Testnet[B3 (paper)]
   Worker <--> DB[(PostgreSQL\nledger conceitual)]
   API[Fastify API] <--> DB
   API --> Dashboard[Dashboard Bootstrap/Chart.js]

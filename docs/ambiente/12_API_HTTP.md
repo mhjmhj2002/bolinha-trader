@@ -6,7 +6,7 @@ Documentar a API Fastify atual. Não há autenticação nem endpoints de BUY/SEL
 
 | Método e path | Objetivo / resposta |
 | --- | --- |
-| `GET /health` | saúde de banco, worker, Binance pública, OpenRouter, loop, reconciliação e ciclo stale |
+| `GET /health` | saúde de banco, worker, B3 pública, OpenRouter, loop, reconciliação e ciclo stale |
 | `GET /status` | banca, fase, sessão, posição, P/L, decisão, ciclos e bloqueios |
 | `GET /positions`, `/trades`, `/decisions`, `/system/events` | histórico persistido |
 | `GET /performance`, `/performance/daily` | desempenho atual e daily result |

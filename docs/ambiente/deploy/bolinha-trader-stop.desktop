@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Bolinha Trader - Parar Projeto
+Comment=Para e encerra todos os serviços do Bolinha Trader mantendo o terminal aberto
+Exec=bash -c 'export PATH="/snap/bin:$HOME/.local/bin:$PATH"; /home/mhj/git/bolinha-trader/docs/ambiente/deploy/stop-all.sh; echo ""; echo "Pressione ENTER para fechar..."; read -r _'
+Icon=process-stop
+Path=/home/mhj/git/bolinha-trader
+Terminal=true
+Categories=Development;Utility;
+StartupNotify=true

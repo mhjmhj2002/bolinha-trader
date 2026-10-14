@@ -3,9 +3,9 @@ import { resolve } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config, defaultTradingConfiguration, isSessionDay, logger, sessionDay, sessionPhase, validateTradingConfiguration } from '@bolinha/core';
 import { ConfigurationBlockedError, TradingRepository } from '@bolinha/database';
-import { BinanceTestnetClient } from '@bolinha/exchange';
+import { createBrokerGateway } from '@bolinha/exchange';
 import { TradingService } from '@bolinha/worker/service';
-const app=Fastify({loggerInstance:logger});const repo=new TradingRepository();const binance=new BinanceTestnetClient(config.BINANCE_API_KEY,config.BINANCE_API_SECRET,config.SYMBOL,undefined,config.BINANCE_RECV_WINDOW_MS);const service=new TradingService(repo,binance);
+const app=Fastify({loggerInstance:logger});const repo=new TradingRepository();const broker=createBrokerGateway(config.SYMBOL);const service=new TradingService(repo,broker);
 const dashboardDirectory = resolve(import.meta.dirname, '../public/dashboard');
 const numberOrNull = (value: unknown) => value === null || value === undefined ? null : Number(value);
 const tradeResponse = (trade: Record<string, unknown>) => ({
@@ -40,9 +40,9 @@ const configurationInput = (body: unknown) => {
 };
 const configurationIdIsSingleton = (id: string | undefined) => id === undefined || id === '1';
 app.get('/health', async () => {
-  let database = 'UP'; let binanceStatus = 'UP'; let openRouter = 'UP';
+  let database = 'UP'; let brokerStatus = 'UP'; let openRouter = 'UP';
   try { await repo.health(); } catch { database = 'DOWN'; }
-  if (!(await binance.pingPublic())) binanceStatus = 'DOWN';
+  if (!(await broker.pingPublic())) brokerStatus = 'DOWN';
   if (!config.OPENROUTER_API_KEY) openRouter = 'DOWN';
   const operational = database === 'UP' ? await repo.configuration() : defaultTradingConfiguration;
   const at = new Date(); const phase = sessionPhase(at, operational);
@@ -55,9 +55,9 @@ app.get('/health', async () => {
   const pendingOrders = database === 'UP' ? await repo.pendingOrderCount() : 0;
   const lastCycleAt = state?.last_cycle_at ? new Date(String(state.last_cycle_at)) : null;
   const cycleStale = Boolean(config.TRADING_LOOP_ENABLED && phase === 'TRADING' && (!lastCycleAt || at.getTime() - lastCycleAt.getTime() > operational.intervalSeconds * 3000));
-  const degraded = database !== 'UP' || worker !== 'UP' || binanceStatus !== 'UP' || openRouter !== 'UP' || reconciliation?.status !== 'OK' || cycleStale;
+  const degraded = database !== 'UP' || worker !== 'UP' || brokerStatus !== 'UP' || openRouter !== 'UP' || reconciliation?.status !== 'OK' || cycleStale;
   const status = database !== 'UP' || worker === 'DOWN' ? 'ERROR' : degraded ? 'DEGRADED' : phase === 'BEFORE_START' ? 'WAITING' : phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING' ? 'FORCE CLOSE' : phase === 'FINISHED' ? 'FINISHED' : 'RUNNING';
-  return { status, database, worker, lastWorkerHeartbeat: heartbeatDate?.toISOString() ?? null, lastCycleAt: lastCycleAt?.toISOString() ?? null, cycleStale, sessionPhase: state?.phase ?? phase, dailyResultStatus, binance: binanceStatus, openRouter, loopEnabled: config.TRADING_LOOP_ENABLED, openPosition: database === 'UP' ? Boolean(await repo.openPosition()) : false, reconciliationStatus: reconciliation?.status ?? 'ERROR', pendingOrders, stateConsistent: reconciliation?.stateConsistent ?? false, timestamp: at.toISOString() };
+  return { status, database, worker, lastWorkerHeartbeat: heartbeatDate?.toISOString() ?? null, lastCycleAt: lastCycleAt?.toISOString() ?? null, cycleStale, sessionPhase: state?.phase ?? phase, dailyResultStatus, broker: brokerStatus, market: 'B3', symbol: config.SYMBOL, openRouter, loopEnabled: config.TRADING_LOOP_ENABLED, openPosition: database === 'UP' ? Boolean(await repo.openPosition()) : false, reconciliationStatus: reconciliation?.status ?? 'ERROR', pendingOrders, stateConsistent: reconciliation?.stateConsistent ?? false, timestamp: at.toISOString() };
 });
 app.get('/dashboard', async (_request, reply) => reply.type('text/html; charset=utf-8').send(await readFile(resolve(dashboardDirectory, 'index.html'), 'utf8')));
 app.get('/dashboard/configuration', async (_request, reply) => reply.type('text/html; charset=utf-8').send(await readFile(resolve(dashboardDirectory, 'configuration.html'), 'utf8')));
@@ -73,7 +73,7 @@ app.get('/dashboard/data', async (request, reply) => {
   const data = await repo.dashboardData(date);
   if (historical) return {
     date, historical, timezone: data.schedule.timezone,
-    health: { status: data.summary?.final ? 'FINISHED' : 'HISTORICAL', database: 'HISTORICAL', worker: 'HISTORICAL', binance: 'HISTORICAL', openRouter: 'HISTORICAL', reconciliationStatus: 'HISTORICAL', loopEnabled: false, lastWorkerHeartbeat: null, lastCycleAt: data.session?.lastCycleAt ?? null, cycleStale: false, pendingOrders: 0, stateConsistent: true, timestamp: new Date().toISOString(), sessionPhase: data.session?.phase ?? 'UNKNOWN', openPosition: Boolean(data.position) },
+    health: { status: data.summary?.final ? 'FINISHED' : 'HISTORICAL', database: 'HISTORICAL', worker: 'HISTORICAL', broker: 'HISTORICAL', openRouter: 'HISTORICAL', reconciliationStatus: 'HISTORICAL', loopEnabled: false, lastWorkerHeartbeat: null, lastCycleAt: data.session?.lastCycleAt ?? null, cycleStale: false, pendingOrders: 0, stateConsistent: true, timestamp: new Date().toISOString(), sessionPhase: data.session?.phase ?? 'UNKNOWN', openPosition: Boolean(data.position) },
     ...data,
   };
   // Only the current dashboard probes live health; a historical view reads PostgreSQL only.
@@ -127,7 +127,7 @@ app.delete('/configuration/:id', async (request, reply) => {
 app.get('/status', async () => {
   const operational = await repo.configuration();
   await repo.ensureAccount(operational.initialBankUsdt);
-  const at = new Date(); const price = await binance.price();
+  const at = new Date(); const price = await broker.price();
   const [state, performance, daily, reconciliation, pendingOrderCount, dailyResultStatus] = await Promise.all([repo.session(at, operational.timezone), repo.performance(price), repo.dailyResult(sessionDay(at, operational.timezone)), repo.reconciliationState(), repo.pendingOrderCount(), repo.dailyResultStatus(sessionDay(at, operational.timezone))]);
   const tradingBlockedReason = reconciliation.status !== 'OK' || !reconciliation.stateConsistent || pendingOrderCount > 0
     ? reconciliation.lastError ?? (pendingOrderCount > 0 ? `${pendingOrderCount} pending order(s) require reconciliation` : `Reconciliation is ${reconciliation.status}`)
@@ -143,7 +143,7 @@ app.get('/status', async () => {
       : performance.realizedPnlUsdt + performance.unrealizedPnlUsdt);
   return { ...performance, loopEnabled: config.TRADING_LOOP_ENABLED, tradingIntervalSeconds: effective.intervalSeconds, timezone: effective.timezone, sessionPhase: state?.phase ?? sessionPhase(at, effective), sessionStartedAt: state?.started_at ?? null, sessionFinishedAt: state?.finished_at ?? null, decisionCyclesToday, operationalChecksToday, forceCloseAttemptsToday: Number(state?.force_close_attempts ?? 0), dailyResultStatus, tradingStartTime: effective.start, stopNewPositionsTime: effective.stopNewPositions, forceCloseTime: effective.forceClose, tradingEndTime: effective.end, configuration, configurationUpdatedAt: operational.updatedAt?.toISOString() ?? null, nextCycleAt: state?.next_cycle_at ?? null, lastCycleAt: state?.last_cycle_at ?? null, cyclesToday: decisionCyclesToday, currentBank: performance.cashUsdt, openPosition: await repo.openPosition(), pnlToday, aiCostToday: daily?.ai_cost_usd ?? 0, tradesToday: daily?.trade_count ?? 0, errorsToday: daily?.error_count ?? 0, lastDecision: await repo.lastDecision(), lastWorkerHeartbeat: await repo.lastHeartbeat(), modelList: config.OPENROUTER_MODELS.split(','), pendingOrderCount, reconciliationStatus: reconciliation.status, lastReconciliationAt: reconciliation.lastReconciliationAt?.toISOString() ?? null, lastReconciliationError: reconciliation.lastError, tradingBlockedReason };
 });
-app.get('/positions',()=>repo.positions());app.get('/trades',async()=> (await repo.trades()).map(tradeResponse));app.get('/decisions',()=>repo.decisions());app.get('/system/events',()=>repo.events());app.get('/performance',async()=>repo.performance(await binance.price()));app.get('/performance/daily',async()=>dailyPerformanceResponse(await repo.dailyResult()));
+app.get('/positions',()=>repo.positions());app.get('/trades',async()=> (await repo.trades()).map(tradeResponse));app.get('/decisions',()=>repo.decisions());app.get('/system/events',()=>repo.events());app.get('/performance',async()=>repo.performance(await broker.price()));app.get('/performance/daily',async()=>dailyPerformanceResponse(await repo.dailyResult()));
 app.get('/reports/daily/:date', async (request, reply) => {
   const { date } = request.params as { date: string };
   if (!isSessionDay(date)) return reply.code(400).send({ error: 'date must use YYYY-MM-DD' });

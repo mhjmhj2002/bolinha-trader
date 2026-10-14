@@ -8,7 +8,9 @@ Este documento consolida a rastreabilidade e status de todas as tarefas e demand
 
 | Identificador | Título / Demanda | Tipo | Status | Localização |
 |---|---|---|---|---|
+| **BUG-03** | Colisão de Order ID na Reinicialização do Paper Broker e Dimensionamento de Banca Fracionada | Bug | **done** | [`docs/tasks/bug/historico/BUG-03-colisao-order-id-paper-e-dimensionamento-banca.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-03-colisao-order-id-paper-e-dimensionamento-banca.md) |
 | **BUG-01** | Rejeição de Ordem Binance Testnet (HTTP 400 -1021 recvWindow) e Bloqueio de Ciclos | Bug | **done** | [`docs/tasks/bug/historico/BUG-01-binance-recvwindow-e-ordem-pendente.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-01-binance-recvwindow-e-ordem-pendente.md) |
+| **BUG-02** | Reconciliação Contínua e Tratamento Robusto de Falha de Rede na Submissão de Ordens | Bug | **done** | [`docs/tasks/bug/historico/BUG-02-reconciliacao-continua-e-falha-de-rede.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-02-reconciliacao-continua-e-falha-de-rede.md) |
 | **TASK-01** | Guia e Regras de Desenvolvimento dos Agentes | Feature/Meta | **done** | [`docs/tasks/historico/TASK-01-agents-guide.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-01-agents-guide.md) |
 | **TASK-02** | Timeout do OpenRouter Parametrizável | Melhoria | **done** | [`docs/tasks/historico/TASK-02-timeout-openrouter-parametrizavel.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-02-timeout-openrouter-parametrizavel.md) |
 | **TASK-03** | Calibração de Prompt de IA (Aversão a Overtrading e Viés de HOLD) | Melhoria/IA | **done** | [`docs/tasks/historico/TASK-03-calibracao-prompt-ia.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-03-calibracao-prompt-ia.md) |
@@ -22,6 +24,12 @@ Este documento consolida a rastreabilidade e status de todas as tarefas e demand
 | **TASK_009** | Ajuste de Fuso Horário CLI e Editabilidade de Config | Core/CLI | **done** | [`docs/tasks/historico/TASK_009_AJUSTAR_FUSO_CLI_E_EDITABILIDADE_CONFIG.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK_009_AJUSTAR_FUSO_CLI_E_EDITABILIDADE_CONFIG.md) |
 | **TASK_010** | Corrigir Cálculo de Ciclos Esperados | Worker/Métricas | **done** | [`docs/tasks/historico/TASK_010_CORRIGIR_CICLOS_ESPERADOS.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK_010_CORRIGIR_CICLOS_ESPERADOS.md) |
 | **TASK_011** | Documentação Completa do Projeto | Documentação | **done** | [`docs/tasks/historico/TASK_011_DOCUMENTACAO_COMPLETA_PROJETO.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK_011_DOCUMENTACAO_COMPLETA_PROJETO.md) |
+| **TASK-05** | Migração Estratégica para o Mercado Brasileiro (B3 Day Trade) | Arquitetura/B3 | **done** | [`docs/tasks/historico/TASK-05-migracao-mercado-acoes-b3.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-05-migracao-mercado-acoes-b3.md) |
+| **TASK-06** | Conector de Simulação e Execução B3 (Paper Trading / MT5 Bridge) | Exchange/B3 | **done** | [`docs/tasks/historico/TASK-06-conector-execucao-b3.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-06-conector-execucao-b3.md) |
+| **TASK-07** | Virada Definitiva para a B3 (Worker, API, Dashboard e Limpeza de Cripto) | Core/Worker/B3 | **done** | [`docs/tasks/historico/TASK-07-virada-definitiva-b3.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-07-virada-definitiva-b3.md) |
+| **TASK-08** | Remoção Completa de Binance / Bitcoin / USDT | Limpeza/B3 | **done** | [`docs/tasks/historico/TASK-08-remocao-binance-bitcoin.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-08-remocao-binance-bitcoin.md) |
+| **TASK-09** | Banca de R$ 100 com Compras Fracionadas | Risk/Exchange/Database | **done** | [`docs/tasks/historico/TASK-09-banca-100-reais-fracionado.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/historico/TASK-09-banca-100-reais-fracionado.md) |
+
 
 ---
 

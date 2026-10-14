@@ -14,6 +14,6 @@ Registrar a stack e sua função. A separação de componentes está em [arquite
 | Pino | logs JSON com segredos redigidos |
 | Vitest | testes unitários e de integração |
 | Bootstrap e Chart.js | interface e gráficos via CDN |
-| Binance/OpenRouter | mercado/Testnet e inferência |
+| B3/OpenRouter | mercado/Testnet e inferência |
 
-Não há Redis, Kafka, Kubernetes, framework frontend pesado ou Binance de produção. Veja os motivos em [decisões](22_DECISOES_ARQUITETURAIS.md).
+Não há Redis, Kafka, Kubernetes, framework frontend pesado ou B3 de produção. Veja os motivos em [decisões](22_DECISOES_ARQUITETURAIS.md).

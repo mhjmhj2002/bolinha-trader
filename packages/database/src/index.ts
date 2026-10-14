@@ -502,7 +502,7 @@ export class TradingRepository {
   }
   async recordExecution(order: {
     id: number;
-    binanceOrderId: string;
+    brokerOrderId: string;
     side: string;
     quantity: number;
     quote: number;
@@ -514,15 +514,15 @@ export class TradingRepository {
     try {
       await c.query('begin');
       // The local order id is tied to the unique clientOrderId; the alternate
-      // lookup makes a replay with a known Binance id idempotent too.
+      // lookup makes a replay with a known broker id idempotent too.
       const persisted = await c.query<Row>(
-        'select * from orders where id=$1 or binance_order_id=$2 order by id=$1 desc for update',
-        [order.id, order.binanceOrderId],
+        'select * from orders where id=$1 or broker_order_id=$2 order by id=$1 desc for update',
+        [order.id, order.brokerOrderId],
       );
       if (!persisted.rows[0]) throw new Error('Cannot record execution for an absent order');
       const pending = persisted.rows[0];
       if (String(pending.status) === 'FILLED') {
-        if (String(pending.binance_order_id) !== order.binanceOrderId || String(pending.side) !== order.side)
+        if (String(pending.broker_order_id) !== order.brokerOrderId || String(pending.side) !== order.side)
           throw new Error('Execution identity conflicts with an already filled order');
         await c.query('commit');
         return { applied: false };
@@ -532,14 +532,14 @@ export class TradingRepository {
       const fills = order.fills ?? [];
       const accounting = executionAccounting(order.side as 'BUY' | 'SELL', order.quantity, order.quote, fills);
       if (accounting.positionQuantity <= 0)
-        throw new Error('Execution leaves no positive BTC quantity after base-asset fees');
+        throw new Error('Execution leaves no positive quantity after base-asset fees');
       const requestedQuantity = pending.requested_quantity === null ? null : num(pending.requested_quantity);
       const fulfilledQuantity = order.side === 'SELL' ? accounting.positionQuantity : order.quantity;
       if (requestedQuantity !== null && Math.abs(requestedQuantity - fulfilledQuantity) > 1e-12)
         throw new Error('Execution quantity does not match the pending order quantity after base-asset fees');
       await c.query(
-        "update orders set binance_order_id=$1,executed_quantity=$2,executed_quote_amount=$3,commission=$4,status='FILLED',executed_at=$5 where id=$6",
-        [order.binanceOrderId, order.quantity, order.quote, accounting.quoteFee, order.at, order.id],
+        "update orders set broker_order_id=$1,executed_quantity=$2,executed_quote_amount=$3,commission=$4,status='FILLED',executed_at=$5 where id=$6",
+        [order.brokerOrderId, order.quantity, order.quote, accounting.quoteFee, order.at, order.id],
       );
       const persistedFills: Array<{ id: number; fill: ExecutionFill }> = [];
       for (const fill of fills) {
@@ -551,14 +551,25 @@ export class TradingRepository {
         persistedFills.push({ id: inserted.rows[0].id, fill });
       }
       if (order.side === 'BUY') {
-        const p = await c.query<{ id: number }>(
-          'insert into positions(symbol,quantity,entry_price,cost_usdt,status,opened_at) values($1,$2,$3,$4,$5,$6) returning id',
-          ['BTCUSDT', accounting.positionQuantity, accounting.effectiveQuoteAmount / accounting.positionQuantity, accounting.effectiveQuoteAmount, 'OPEN', order.at],
-        );
+        const open = await c.query<Row>("select * from positions where status='OPEN' order by id desc limit 1 for update");
+        let positionId: number;
+        if (open.rows[0]) {
+          // Aumento de posição: soma quantidade/custo e recalcula o preço médio.
+          const quantity = num(open.rows[0].quantity) + accounting.positionQuantity;
+          const cost = num(open.rows[0].cost_usdt) + accounting.effectiveQuoteAmount;
+          await c.query('update positions set quantity=$1,entry_price=$2,cost_usdt=$3 where id=$4', [quantity, cost / quantity, cost, open.rows[0].id]);
+          positionId = Number(open.rows[0].id);
+        } else {
+          const p = await c.query<{ id: number }>(
+            'insert into positions(symbol,quantity,entry_price,cost_usdt,status,opened_at) values($1,$2,$3,$4,$5,$6) returning id',
+            [config.SYMBOL, accounting.positionQuantity, accounting.effectiveQuoteAmount / accounting.positionQuantity, accounting.effectiveQuoteAmount, 'OPEN', order.at],
+          );
+          positionId = p.rows[0].id;
+        }
         const trade = await c.query<{ id: number }>(
           `insert into trades(order_id,position_id,side,quantity,quote_amount,net_quantity,net_quote_amount,fees_usdt_known,commission,executed_at)
            values($1,$2,$3,$4,$5,$6,$7,$8,$8,$9) returning id`,
-          [order.id, p.rows[0].id, 'BUY', order.quantity, order.quote, accounting.positionQuantity, accounting.effectiveQuoteAmount, accounting.quoteFee, order.at],
+          [order.id, positionId, 'BUY', order.quantity, order.quote, accounting.positionQuantity, accounting.effectiveQuoteAmount, accounting.quoteFee, order.at],
         );
         await this.recordTradeFees(c, trade.rows[0].id, persistedFills);
         await c.query('update trading_account set cash_usdt=cash_usdt-$1,updated_at=now()', [accounting.effectiveQuoteAmount]);
@@ -569,21 +580,22 @@ export class TradingRepository {
         if (!pos.rows[0]) throw new Error('Cannot close absent position');
         const p = pos.rows[0];
         const positionQuantity = num(p.quantity);
-        if (Math.abs(positionQuantity - accounting.positionQuantity) > 1e-12)
-          throw new Error('Refusing to close a position after a partial SELL execution or an unaccounted base-asset fee');
+        if (accounting.positionQuantity > positionQuantity + 1e-12)
+          throw new Error('Refusing to SELL more than the open position');
+        const fraction = Math.min(1, accounting.positionQuantity / positionQuantity);
+        const fullClose = Math.abs(positionQuantity - accounting.positionQuantity) <= 1e-12;
         const cost = num(p.cost_usdt);
-        const opening = await c.query<Row>(
-          "select quote_amount from trades where position_id=$1 and side='BUY' order by id limit 1",
-          [p.id],
-        );
-        if (!opening.rows[0]) throw new Error('Cannot calculate P/L without the opening BUY trade');
-        const grossPnl = order.quote - num(opening.rows[0].quote_amount);
-        const pnl = accounting.effectiveQuoteAmount - cost;
-        await c.query("update positions set status='CLOSED',closed_at=$1,realized_pnl_usdt=$2 where id=$3", [
-          order.at,
-          pnl,
-          p.id,
-        ]);
+        const costOfSold = fullClose ? cost : cost * fraction;
+        const grossPnl = order.quote - costOfSold;
+        const pnl = accounting.effectiveQuoteAmount - costOfSold;
+        if (fullClose) {
+          await c.query("update positions set status='CLOSED',closed_at=$1,realized_pnl_usdt=coalesce(realized_pnl_usdt,0)+$2 where id=$3", [order.at, pnl, p.id]);
+        } else {
+          await c.query(
+            'update positions set quantity=quantity-$1,cost_usdt=cost_usdt-$2,realized_pnl_usdt=coalesce(realized_pnl_usdt,0)+$3 where id=$4',
+            [accounting.positionQuantity, costOfSold, pnl, p.id],
+          );
+        }
         const trade = await c.query<{ id: number }>(
           `insert into trades(order_id,position_id,side,quantity,quote_amount,net_quantity,net_quote_amount,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,commission,executed_at)
            values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$11) returning id`,
@@ -614,7 +626,7 @@ export class TradingRepository {
       const asset = fill.commissionAsset.toUpperCase();
       await c.query(
         'insert into trade_fees(trade_id,fill_id,asset,amount,amount_usdt) values($1,$2,$3,$4,$5)',
-        [tradeId, id, asset, fill.commission, asset === 'USDT' ? fill.commission : null],
+        [tradeId, id, asset, fill.commission, asset === 'BRL' ? fill.commission : null],
       );
     }
   }
@@ -902,7 +914,7 @@ export class TradingRepository {
         maxCycleGapSeconds,
         workerRestarts: Math.max(0, eventCount('worker_started') - 1),
         errors: events.filter((row) => String(row.level) === 'ERROR').length,
-        binanceErrors: events.filter((row) => String(row.event) === 'external_service_error' && payloadService(row) === 'binance').length,
+        brokerErrors: events.filter((row) => String(row.event) === 'external_service_error' && payloadService(row) === 'broker').length,
         openRouterErrors: events.filter((row) => String(row.event) === 'ai_error' || (String(row.event) === 'external_service_error' && payloadService(row) === 'openrouter')).length,
         inconsistencies: eventCount('state_inconsistency_detected'),
         reconciliationIssues: eventCount('reconciliation_failed'),
@@ -931,7 +943,7 @@ export class TradingRepository {
         `select cash_usdt,equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,net_pnl_usdt,price,position_quantity,position_cost_usdt,created_at
          from account_snapshots where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at`, localDay),
       this.client.query<Row>(
-        `select t.side,t.quantity,t.quote_amount,t.net_quantity,t.net_quote_amount,t.gross_pnl_usdt,t.fees_usdt_known,t.net_pnl_usdt,t.executed_at,o.binance_order_id
+        `select t.side,t.quantity,t.quote_amount,t.net_quantity,t.net_quote_amount,t.gross_pnl_usdt,t.fees_usdt_known,t.net_pnl_usdt,t.executed_at,o.broker_order_id
          from trades t join orders o on o.id=t.order_id
          where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1 order by t.executed_at desc`, localDay),
       this.client.query<Row>(
@@ -1002,8 +1014,8 @@ export class TradingRepository {
       session: session && { day, phase: String(session.phase), timezone: String(session.timezone), startedAt: session.started_at ? new Date(String(session.started_at)).toISOString() : null, finishedAt: session.finished_at ? new Date(String(session.finished_at)).toISOString() : null, lastCycleAt: session.last_cycle_at ? new Date(String(session.last_cycle_at)).toISOString() : null, nextCycleAt: session.next_cycle_at ? new Date(String(session.next_cycle_at)).toISOString() : null, cyclesToday: num(session.cycles_today) },
       account: { initialBankUsdt, cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null), equityUsdt: finalEquity, aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd) },
       performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt, returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
-      position: latest?.positionQuantity ? { symbol: config.SYMBOL.replace('USDT', ''), quantity: latest.positionQuantity, costUsdt: latest.positionCostUsdt, price: latest.price } : null,
-      decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), binanceOrderId: row.binance_order_id })),
+      position: latest?.positionQuantity ? { symbol: config.SYMBOL, quantity: latest.positionQuantity, costUsdt: latest.positionCostUsdt, price: latest.price } : null,
+      decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), brokerOrderId: row.broker_order_id })),
       aiUsage: { models, fallbacks: fallbackCount, totalTokens: models.reduce((total, model) => total + model.totalTokens, 0), totalCostUsd: models.reduce((total, model) => total + model.costUsd, 0) },
       events: eventsResult.rows.map((row) => ({ level: row.level, event: row.event, message: row.message, at: new Date(String(row.created_at)).toISOString() })),
       equityHistory: snapshots.map(({ at, cashUsdt, equityUsdt }) => ({ at, cashUsdt, equityUsdt })),

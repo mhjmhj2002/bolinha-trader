@@ -4,7 +4,7 @@
 
 Registrar controles e limitações atuais.
 
-- código só aceita `BINANCE_ENV=testnet`; produção não é suportada;
+- código só aceita `(removido)=testnet`; produção não é suportada;
 - chaves ficam em `.env`, que não deve ser versionado; logs Pino redigem campos sensíveis;
 - API Compose é publicada em `127.0.0.1:3000`, sem autenticação; não a exponha diretamente;
 - `TRADING_LOOP_ENABLED=false` é kill switch padrão;

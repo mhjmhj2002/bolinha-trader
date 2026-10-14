@@ -6,8 +6,8 @@
   const timezone = () => data?.schedule?.timezone || data?.timezone || 'UTC';
   const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: timezone() }).format(new Date());
   const number = (value, digits = 2) => value === null || value === undefined ? '—' : Number(value).toLocaleString('pt-BR', { minimumFractionDigits: digits, maximumFractionDigits: digits });
-  const money = (value, currency = 'USDT', digits = 2) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '' : '-'}${currency === 'US$' ? 'US$ ' : ''}${number(Math.abs(value), digits)}${currency === 'USDT' ? ' USDT' : ''}`;
-  const signedMoney = (value) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '+' : '-'}${number(Math.abs(value))} USDT`;
+  const money = (value, currency = 'R$', digits = 2) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '' : '-'}${currency === 'US$' ? 'US$ ' : currency === 'R$' ? 'R$ ' : ''}${number(Math.abs(value), digits)}${currency === 'USDT' ? ' USDT' : ''}`;
+  const signedMoney = (value) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '+' : '-'}${number(Math.abs(value))} R$`;
   const time = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(iso)) : '—';
   const dateTime = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), dateStyle: 'short', timeStyle: 'short' }).format(new Date(iso)) : '—';
   const escape = (value) => String(value ?? '—').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
@@ -26,9 +26,10 @@
   }
   function renderHealth(payload) {
     const health = payload.health;
+    const marketLabel = health.market === 'B3' ? 'B3 / MT5' : 'Exchange';
     const rows = [
       ['Horário', time(health.timestamp)], ['Loop', health.loopEnabled ? 'ON' : 'OFF'], ['Fase', health.sessionPhase], ['Worker', health.worker],
-      ['Binance', health.binance], ['OpenRouter', health.openRouter], ['PostgreSQL', health.database], ['Reconciliação', health.reconciliationStatus],
+      [marketLabel, health.broker], ['OpenRouter', health.openRouter], ['PostgreSQL', health.database], ['Reconciliação', health.reconciliationStatus],
       ['Último ciclo', time(health.lastCycleAt)], ['Próximo ciclo', time(payload.session?.nextCycleAt)], ['Pendentes', health.pendingOrders], ['Heartbeat', time(health.lastWorkerHeartbeat)],
     ];
     $('health-grid').innerHTML = rows.map(([name, value]) => `<div class="col-6 col-md-3 col-xl-2"><div class="status-item ${healthTone(value)}"><span class="status-name">${name}</span><span class="status-value">${escape(value)}</span></div></div>`).join('');
@@ -54,18 +55,18 @@
     chart('equity-chart', 'line', labels, [
       { label: 'Patrimônio', data: payload.equityHistory.map((point) => point.equityUsdt), borderColor: '#0d6efd', backgroundColor: 'rgba(13,110,253,.12)', fill: true, tension: .25 },
       { label: 'Caixa', data: payload.equityHistory.map((point) => point.cashUsdt), borderColor: '#6c757d', borderDash: [5, 5], tension: .25 },
-    ], { scales: { y: { title: { display: true, text: 'USDT' } } } });
+    ], { scales: { y: { title: { display: true, text: 'R$' } } } });
     const counts = payload.decisionCounts;
     chart('decisions-chart', 'doughnut', ['BUY', 'SELL', 'HOLD'], [{ data: [counts.BUY, counts.SELL, counts.HOLD], backgroundColor: ['#198754', '#dc3545', '#6c757d'] }]);
     $('rejected-decisions').textContent = `${counts.rejectedByRisk} decisão(ões) rejeitada(s) pelo risco`;
     chart('pnl-chart', 'line', payload.pnlHistory.map((point) => time(point.at)), [
       { label: 'P/L total', data: payload.pnlHistory.map((point) => point.totalPnlUsdt), borderColor: '#198754', tension: .25 },
       { label: 'P/L realizado', data: payload.pnlHistory.map((point) => point.realizedPnlUsdt), borderColor: '#6f42c1', tension: .25 },
-    ], { scales: { y: { title: { display: true, text: 'USDT' } } } });
+    ], { scales: { y: { title: { display: true, text: 'R$' } } } });
     chart('models-chart', 'bar', payload.aiUsage.models.map((model) => model.model), [{ label: 'Chamadas', data: payload.aiUsage.models.map((model) => model.calls), backgroundColor: '#0d6efd' }], { indexAxis: 'y', scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } });
   }
   function renderTables(payload) {
-    $('trades-table').innerHTML = payload.trades.length ? payload.trades.map((trade) => `<tr><td>${time(trade.at)}</td><td>${badge(trade.side)}</td><td>${number(trade.netQuantity ?? trade.quantity, 8)}</td><td>${trade.quantity ? money(trade.quoteAmount / trade.quantity).replace(' USDT', '') : '—'}</td><td>${money(trade.netQuoteAmount ?? trade.quoteAmount)}</td><td>${money(trade.feesUsdtKnown)}</td><td class="${Number(trade.netPnlUsdt) < 0 ? 'text-danger' : Number(trade.netPnlUsdt) > 0 ? 'text-success' : ''}">${trade.netPnlUsdt === null ? '—' : signedMoney(trade.netPnlUsdt)}</td><td class="font-monospace small">${escape(trade.binanceOrderId)}</td></tr>`).join('') : empty(8, 'Nenhum trade no dia.');
+    $('trades-table').innerHTML = payload.trades.length ? payload.trades.map((trade) => `<tr><td>${time(trade.at)}</td><td>${badge(trade.side)}</td><td>${number(trade.netQuantity ?? trade.quantity, 0)}</td><td>${trade.quantity ? money(trade.quoteAmount / trade.quantity) : '—'}</td><td>${money(trade.netQuoteAmount ?? trade.quoteAmount)}</td><td>${money(trade.feesUsdtKnown)}</td><td class="${Number(trade.netPnlUsdt) < 0 ? 'text-danger' : Number(trade.netPnlUsdt) > 0 ? 'text-success' : ''}">${trade.netPnlUsdt === null ? '—' : signedMoney(trade.netPnlUsdt)}</td><td class="font-monospace small">${escape(trade.brokerOrderId)}</td></tr>`).join('') : empty(8, 'Nenhum trade no dia.');
     $('decisions-table').innerHTML = payload.decisions.length ? payload.decisions.map((decision) => `<tr class="${decision.actionRequested !== decision.actionAfterRisk ? 'table-warning' : ''}"><td>${time(decision.at)}</td><td class="small">${escape(decision.model)}</td><td>${badge(decision.actionRequested)}</td><td>${badge(decision.actionAfterRisk)}</td><td>${money(decision.amountAfterRisk)}</td><td>${number(decision.confidence * 100, 0)}%</td><td class="reason">${escape(decision.reason)}</td><td class="reason">${escape(decision.rejectionReason)}</td></tr>`).join('') : empty(8, 'Nenhuma decisão no dia.');
     renderEvents();
   }

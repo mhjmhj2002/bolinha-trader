@@ -8,7 +8,7 @@ const input = (overrides: Partial<DailyReportInput> = {}): DailyReportInput => (
   bank: { initialUsdt: 20, finalUsdt: 20, netPnlUsdt: 0 },
   operations: { buy: 0, sell: 0, hold: 53, rejectedByRisk: 0, forceClose: false },
   ai: { calls: 53, costUsd: 0, fallbacks: 0, models: {} },
-  infrastructure: { cyclesExpected: 53, cyclesExecuted: 53, maxCycleGapSeconds: 600, workerRestarts: 0, errors: 0, binanceErrors: 0, openRouterErrors: 0, inconsistencies: 0, reconciliationIssues: 0, pendingOrders: 0, rejectedOrders: 0 },
+  infrastructure: { cyclesExpected: 53, cyclesExecuted: 53, maxCycleGapSeconds: 600, workerRestarts: 0, errors: 0, brokerErrors: 0, openRouterErrors: 0, inconsistencies: 0, reconciliationIssues: 0, pendingOrders: 0, rejectedOrders: 0 },
   finalState: { openPosition: false },
   ...overrides,
 });
@@ -35,9 +35,9 @@ describe('daily operational report', () => {
   it('highlights fallbacks and external errors', () => {
     const report = buildDailyReport(input({
       ai: { calls: 53, costUsd: 0.0031, fallbacks: 2, models: { Qwen: 53 } },
-      infrastructure: { ...input().infrastructure, errors: 2, binanceErrors: 1, openRouterErrors: 1 },
+      infrastructure: { ...input().infrastructure, errors: 2, brokerErrors: 1, openRouterErrors: 1 },
     }));
-    expect(report.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(expect.arrayContaining(['FALLBACK', 'BINANCE_ERROR', 'OPENROUTER_ERROR']));
+    expect(report.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(expect.arrayContaining(['FALLBACK', 'BROKER_ERROR', 'OPENROUTER_ERROR']));
     expect(report.operationalResult).toBe('CRÍTICO');
   });
 

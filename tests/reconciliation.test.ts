@@ -37,13 +37,13 @@ function crashedExecutionFixture(pendingOrder: Pending, hasPosition = false) {
     event: async (_level: string, event: string) => { events.push(event); },
   };
   const exchange = {
-    orderByClientId: async (clientOrderId: string) => ({ orderId: `binance-${clientOrderId}`, clientOrderId, status: 'FILLED', side: pendingOrder.side, executedQty: pendingOrder.requestedQuantity, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }),
+    orderByClientId: async (clientOrderId: string) => ({ orderId: `broker-${clientOrderId}`, clientOrderId, status: 'FILLED', side: pendingOrder.side, executedQty: pendingOrder.requestedQuantity, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }),
   };
   return { repo, exchange, values: () => ({ position, cash, trades, recordCalls, events }) };
 }
 
 describe('startup reconciliation after a process crash', () => {
-  it('records a Binance-filled BUY exactly once after crashing before recordExecution', async () => {
+  it('records a B3-filled BUY exactly once after crashing before recordExecution', async () => {
     const fixture = crashedExecutionFixture({ id: 1, clientOrderId: 'buy-after-crash', side: 'BUY', requestedQuantity: 0.001 });
     const service = new TradingService(fixture.repo as never, fixture.exchange as never, {} as never);
 
@@ -66,18 +66,18 @@ describe('startup reconciliation after a process crash', () => {
     expect(fixture.values().events).toContain('position_closed');
   });
 
-  it('can reconcile after more than three transient Binance failures, without a restart', async () => {
+  it('can reconcile after more than three transient B3 failures, without a restart', async () => {
     const fixture = crashedExecutionFixture({ id: 3, clientOrderId: 'retry-after-outage', side: 'BUY', requestedQuantity: 0.001 });
     let available = false;
     fixture.exchange.orderByClientId = async (clientOrderId: string) => {
-      if (!available) throw new Error('Binance temporarily unavailable');
-      return { orderId: `binance-${clientOrderId}`, clientOrderId, status: 'FILLED', side: 'BUY', executedQty: 0.001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() };
+      if (!available) throw new Error('Broker temporarily unavailable');
+      return { orderId: `broker-${clientOrderId}`, clientOrderId, status: 'FILLED', side: 'BUY', executedQty: 0.001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() };
     };
     const service = new TradingService(fixture.repo as never, fixture.exchange as never, {} as never);
 
-    await expect(service.reconcileStateOnStartup()).rejects.toThrow('Binance unavailable');
-    await expect(service.reconcileStateOnStartup()).rejects.toThrow('Binance unavailable');
-    await expect(service.reconcileStateOnStartup()).rejects.toThrow('Binance unavailable');
+    await expect(service.reconcileStateOnStartup()).rejects.toThrow('broker unavailable');
+    await expect(service.reconcileStateOnStartup()).rejects.toThrow('broker unavailable');
+    await expect(service.reconcileStateOnStartup()).rejects.toThrow('broker unavailable');
     available = true;
     await expect(service.reconcileStateOnStartup()).resolves.toMatchObject({ status: 'OK' });
 

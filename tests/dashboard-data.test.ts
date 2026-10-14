@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { config } from '@bolinha/core';
 import { TradingRepository } from '@bolinha/database';
 
 const result = (rows: Record<string, unknown>[]) => ({ rows });
@@ -26,7 +27,7 @@ describe('dashboard/data aggregation', () => {
     const data = await repo.dashboardData('2026-09-30');
 
     expect(data.performance).toMatchObject({ netPnlUsdt: 0.5, returnPct: 2.5 });
-    expect(data.position).toMatchObject({ symbol: 'BTC', quantity: 0.0001 });
+    expect(data.position).toMatchObject({ symbol: config.SYMBOL.replace('USDT', ''), quantity: 0.0001 });
     expect(data.decisionCounts).toEqual({ BUY: 0, SELL: 1, HOLD: 1, rejectedByRisk: 1 });
     expect(data.aiUsage).toMatchObject({ fallbacks: 1, totalTokens: 70, totalCostUsd: 0.0021 });
     expect(data.aiUsage.models[0]).toMatchObject({ model: 'Qwen', calls: 2 });

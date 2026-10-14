@@ -1,8 +1,8 @@
 # Bolinha Trader
 
-**Operação Bolinha de Gude** é um experimento de trading autônomo para `BTCUSDT`: dados públicos da Binance, sinais de IA via OpenRouter, risco determinístico, execução na Binance Spot Testnet e ledger conceitual em PostgreSQL.
+**Operação Bolinha de Gude** é um experimento de trading autônomo para `PETR4`: dados de mercado B3, sinais de IA via OpenRouter, risco determinístico, execução na B3 em modo paper (simulado) e ledger conceitual em PostgreSQL.
 
-> Nesta fase o projeto opera **somente Binance Spot Testnet**. Não há dinheiro real.
+> Nesta fase o projeto opera **somente B3 em modo paper (simulado)**. Não há dinheiro real.
 
 ## Quick start
 
@@ -26,7 +26,6 @@ Preencha as credenciais Testnet e OpenRouter antes de habilitar o loop. Veja o [
 7. [Trading lifecycle](docs/ambiente/07_TRADING_LIFECYCLE.md)
 8. [Motor de risco](docs/ambiente/08_MOTOR_DE_RISCO.md)
 9. [IA e OpenRouter](docs/ambiente/09_IA_E_OPENROUTER.md)
-10. [Binance Testnet](docs/ambiente/10_BINANCE_TESTNET.md)
 11. [Persistência e banco](docs/ambiente/11_PERSISTENCIA_E_BANCO.md)
 12. [API HTTP](docs/ambiente/12_API_HTTP.md)
 13. [Dashboard](docs/ambiente/13_DASHBOARD_E_PAGINAS_WEB.md)

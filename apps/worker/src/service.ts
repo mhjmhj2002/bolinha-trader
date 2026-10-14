@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { config, defaultTradingConfiguration, logger, sessionPhase, type TradingConfiguration } from '@bolinha/core';
 import { makeSnapshot } from '@bolinha/market-data';
-import { OpenRouterClient, buildPrompt } from '@bolinha/ai';
-import { applyRisk } from '@bolinha/risk-engine';
-import { BinanceTestnetClient, type BinanceGateway, type ExchangeOrder } from '@bolinha/exchange';
+import { OpenRouterClient, buildB3Prompt } from '@bolinha/ai';
+import { applyB3Risk } from '@bolinha/risk-engine';
+import { createBrokerGateway, type BrokerGateway, type ExchangeOrder } from '@bolinha/exchange';
 import { executionAccounting } from '@bolinha/database';
 import { TradingRepository } from '@bolinha/database';
 
@@ -12,13 +12,7 @@ type Severity = 'INFO' | 'WARN' | 'ERROR';
 export class TradingService {
   constructor(
     private repo = new TradingRepository(),
-    private exchange: BinanceGateway = new BinanceTestnetClient(
-      config.BINANCE_API_KEY,
-      config.BINANCE_API_SECRET,
-      config.SYMBOL,
-      undefined,
-      config.BINANCE_RECV_WINDOW_MS,
-    ),
+    private exchange: BrokerGateway = createBrokerGateway(config.SYMBOL),
     private ai = new OpenRouterClient(
       config.OPENROUTER_API_KEY,
       config.OPENROUTER_MODELS.split(',')
@@ -78,7 +72,7 @@ export class TradingService {
   ) {
     const outcome = await this.repo.recordExecution({
       id: local.id,
-      binanceOrderId: order.orderId,
+      brokerOrderId: order.orderId,
       side: order.side,
       quantity: order.executedQty,
       quote: order.cummulativeQuoteQty,
@@ -111,10 +105,15 @@ export class TradingService {
 
   /** Rebuild the conceptual ledger from known application orders only. */
   async reconcileStateOnStartup() {
-    return this.exclusive(() => this.reconcileStateOnStartupLocked());
+    return this.exclusive(() => this.reconcileStateLocked('startup'));
   }
 
-  private async reconcileStateOnStartupLocked() {
+  /** Attempt operational reconciliation when blocked by pending orders or after errors. */
+  async reconcileOperationalState() {
+    return this.exclusive(() => this.reconcileStateLocked('runtime'));
+  }
+
+  private async reconcileStateLocked(context: 'startup' | 'runtime' = 'startup') {
     const reconciliationRepo = this.repo as TradingRepository & {
       pendingOrders?: () => Promise<Array<{ id: number; clientOrderId: string; side: 'BUY' | 'SELL'; requestedQuantity: number | null }>>;
       reconciliationStarted?: () => Promise<void>;
@@ -132,9 +131,9 @@ export class TradingService {
     await metricsRepo.recordReconciliationRun?.();
     await reconciliationRepo.reconciliationStarted();
     try {
-      await this.event('INFO', 'reconciliation_started', 'Startup reconciliation started');
+      await this.event('INFO', 'reconciliation_started', `${context === 'startup' ? 'Startup' : 'Runtime'} reconciliation started`);
       // These reads intentionally happen before handling orders: PostgreSQL is
-      // the conceptual source of truth; Binance balances are never inspected.
+      // the conceptual source of truth; broker balances are never inspected.
       await Promise.all([this.repo.account(), this.repo.openPosition()]);
       const pendingOrders = await reconciliationRepo.pendingOrders();
       for (const pending of pendingOrders) {
@@ -142,19 +141,20 @@ export class TradingService {
         try {
           remote = await this.exchange.orderByClientId(pending.clientOrderId);
         } catch (error) {
-          throw new Error(`Binance unavailable while reconciling ${pending.clientOrderId}: ${error instanceof Error ? error.message : 'unknown error'}`);
+          throw new Error(`broker unavailable while reconciling ${pending.clientOrderId}: ${error instanceof Error ? error.message : 'unknown error'}`);
         }
         if (!remote) {
-          await this.repo.markOrderRejected(pending.id, 'Binance confirmed no order exists for clientOrderId during startup reconciliation');
-          await this.event('INFO', 'pending_order_reconciled', 'Pending order rejected after Binance confirmed it does not exist', {
+          await this.repo.markOrderRejected(pending.id, `broker confirmed no order exists for clientOrderId during ${context} reconciliation`);
+          await this.event('INFO', 'pending_order_reconciled', 'Pending order rejected after broker confirmed it does not exist', {
             clientOrderId: pending.clientOrderId,
             outcome: 'REJECTED',
+            context,
           });
           continue;
         }
         if (remote.status !== 'FILLED') {
-          const reason = `Binance order ${pending.clientOrderId} is still ${remote.status}`;
-          await this.event('ERROR', 'state_inconsistency_detected', 'Pending order remains ambiguous on Binance', {
+          const reason = `broker order ${pending.clientOrderId} is still ${remote.status}`;
+          await this.event('ERROR', 'state_inconsistency_detected', 'Pending order remains ambiguous on broker', {
             clientOrderId: pending.clientOrderId,
             status: remote.status,
           });
@@ -164,14 +164,15 @@ export class TradingService {
           ? executionAccounting(remote.side, remote.executedQty, remote.cummulativeQuoteQty, remote.fills ?? []).positionQuantity
           : remote.executedQty;
         if (remote.side !== pending.side || (pending.requestedQuantity !== null && Math.abs(reconciledQuantity - pending.requestedQuantity) > 1e-12)) {
-          const reason = `Binance execution for ${pending.clientOrderId} does not match the local pending order`;
+          const reason = `broker execution for ${pending.clientOrderId} does not match the local pending order`;
           await this.event('ERROR', 'state_inconsistency_detected', reason, { clientOrderId: pending.clientOrderId });
           throw new Error(reason);
         }
         const result = await this.persistExecution(pending, remote, 'reconciliation');
-        await this.event('INFO', 'pending_order_reconciled', 'Pending order reconciled from Binance execution', {
+        await this.event('INFO', 'pending_order_reconciled', 'Pending order reconciled from broker execution', {
           clientOrderId: pending.clientOrderId,
-        outcome: result.applied ? 'FILLED' : 'ALREADY_RECONCILED',
+          outcome: result.applied ? 'FILLED' : 'ALREADY_RECONCILED',
+          context,
         });
       }
       const consistency = await reconciliationRepo.stateConsistency();
@@ -180,12 +181,12 @@ export class TradingService {
         throw new Error(consistency.reason ?? 'Ledger consistency check failed');
       }
       await reconciliationRepo.reconciliationCompleted();
-      await this.event('INFO', 'reconciliation_completed', 'Startup reconciliation completed', { pendingOrderCount: 0 });
+      await this.event('INFO', 'reconciliation_completed', `${context === 'startup' ? 'Startup' : 'Runtime'} reconciliation completed`, { pendingOrderCount: 0 });
       return { status: 'OK' as const, pendingOrders: 0 };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown reconciliation error';
       await reconciliationRepo.reconciliationFailed(message);
-      await this.event('ERROR', 'reconciliation_failed', 'Startup reconciliation failed; trading remains blocked', { error: message });
+      await this.event('ERROR', 'reconciliation_failed', `${context === 'startup' ? 'Startup' : 'Runtime'} reconciliation failed; trading remains blocked`, { error: message });
       throw error;
     }
   }
@@ -227,26 +228,35 @@ export class TradingService {
         order = await this.exchange.placeMarketOrder(side, quantity, clientOrderId);
       }
     } catch (error) {
-      order = await this.exchange.orderByClientId(clientOrderId);
+      const message = error instanceof Error ? error.message : 'Unknown order submission error';
+      try {
+        order = await this.exchange.orderByClientId(clientOrderId);
+      } catch (checkError) {
+        // Se a consulta à broker também falhar (ex: rede fora), mantemos order como undefined/null
+        // para falhar fechado (fail-closed) sem descartar uma possível ordem executada.
+        const checkMessage = checkError instanceof Error ? checkError.message : 'Unknown order check error';
+        await this.event('ERROR', 'external_service_error', 'Failed to query broker for order status after submission error', {
+          service: 'broker',
+          clientOrderId,
+          submissionError: message,
+          checkError: checkMessage,
+        });
+      }
       if (!order) {
-        const message = error instanceof Error ? error.message : 'Unknown order submission error';
         await this.event('ERROR', 'external_service_error', 'Testnet order could not be verified', {
-          service: 'binance',
+          service: 'broker',
           clientOrderId,
           error: message,
         });
-        // Se a Binance rejeitou a ordem com erro 400 (ex: recvWindow -1021 ou validação) e comprovadamente
-        // a ordem nunca foi registrada (orderByClientId retornou null), marcamos como REJECTED
-        // para não travar os ciclos subsequentes em PENDING.
-        const isBinanceRejection = message.includes('Binance Testnet HTTP 400') || message.includes('Binance public HTTP 400');
-        if (isBinanceRejection) {
-          await this.repo.markOrderRejected(orderId, `Binance rejected order submission: ${message}`);
-          await this.event('WARN', 'pending_order_reconciled', 'Pending order marked as rejected after Binance rejected submission and confirmed no order exists', {
-            clientOrderId,
-            outcome: 'REJECTED',
-            reason: message,
-          });
-        }
+        // Se a consulta orderByClientId retornou null comprovando que a broker NÃO possui a ordem
+        // (por rejeição HTTP 400 ou porque a falha de rede impediu a ordem de ser criada),
+        // marcamos como REJECTED para desobstruir os ciclos futuros.
+        await this.repo.markOrderRejected(orderId, `Order submission failed and broker confirmed order does not exist: ${message}`);
+        await this.event('WARN', 'pending_order_reconciled', 'Pending order marked as rejected after broker confirmed no order exists', {
+          clientOrderId,
+          outcome: 'REJECTED',
+          reason: message,
+        });
         throw error;
       }
     }
@@ -267,7 +277,23 @@ export class TradingService {
   private async runOnceLocked(at: Date, configuration: TradingConfiguration) {
     await this.repo.ensureAccount(configuration.initialBankUsdt);
     await this.repo.heartbeat();
-    const ready = await this.tradingReady();
+    let ready = await this.tradingReady();
+    if (!ready.ready) {
+      const blockedReason = ready.reason;
+      // Se houver ordens pendentes bloqueando o ciclo, tenta auto-recuperação/reconciliação imediata com a exchange
+      try {
+        await this.reconcileStateLocked('runtime');
+        ready = await this.tradingReady();
+      } catch (reconcileError) {
+        // Se a reconciliação falhar (ex: rede fora), mantém o log e bloqueio seguro fail-closed
+        const recMsg = reconcileError instanceof Error ? reconcileError.message : 'Unknown reconciliation error';
+        await this.event('WARN', 'cycle_skipped', 'Trading cycle blocked pending reconciliation; runtime reconciliation attempt failed', {
+          reason: blockedReason,
+          reconcileError: recMsg,
+        });
+        return { action: 'HOLD' as const, reason: blockedReason };
+      }
+    }
     if (!ready.ready) {
       await this.event('WARN', 'cycle_skipped', 'Trading cycle blocked pending reconciliation', { reason: ready.reason });
       return { action: 'HOLD' as const, reason: ready.reason };
@@ -302,7 +328,7 @@ export class TradingService {
           'ERROR',
           'external_service_error',
           'Could not retrieve market data or exchange rules',
-          { service: 'binance', error: message },
+          { service: 'broker', error: message },
         );
         throw error;
       }
@@ -310,11 +336,15 @@ export class TradingService {
       const snapshot = makeSnapshot(config.SYMBOL, { '1m': one, '5m': five, '15m': fifteen });
       const snapshotId = await this.repo.saveSnapshot(snapshot);
       // One compact point per cycle keeps dashboard charts historical without
-      // making the browser poll Binance or the database directly.
+      // making the browser poll broker or the database directly.
       const dashboardRepo = this.repo as TradingRepository & { saveAccountSnapshot?: (price: number, at: Date) => Promise<void> };
       if (dashboardRepo.saveAccountSnapshot)
         await dashboardRepo.saveAccountSnapshot(snapshot.intervals['1m'].price, at);
-      const response = await this.ai.decide(buildPrompt(snapshot, account, position));
+      const currentPrice = snapshot.intervals['1m'].price;
+      const b3Account = { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt };
+      const b3Position = position ? { ticker: config.SYMBOL, quantity: position.quantity, entryPrice: position.entryPrice, costBrl: position.costUsdt } : null;
+
+      const response = await this.ai.decide(buildB3Prompt(snapshot, b3Account, b3Position, currentPrice));
       if (response.usage.fallbackUsed)
         await this.event('WARN', 'ai_fallback', 'OpenRouter fallback model was used', {
           model: response.usage.modelRequested,
@@ -323,16 +353,19 @@ export class TradingService {
         await this.event('ERROR', 'ai_error', 'OpenRouter did not return a usable decision', {
           error: response.usage.error,
         });
-      let risk = applyRisk({
+
+      const b3Res = applyB3Risk({
         action: response.decision.action,
-        requestedUsdt: response.decision.amountUsdt,
-        price: snapshot.intervals['1m'].price,
-        account,
-        position,
+        requestedBrl: response.decision.amountUsdt,
+        price: currentPrice,
+        account: b3Account,
+        position: b3Position,
         rules,
         maxPositionPercent: configuration.maxPositionPercent,
         duplicateOrderPending: pending,
+        isDayTradeCloseOnly: phase === 'NO_NEW_POSITIONS',
       });
+      let risk = { action: b3Res.action, amountUsdt: b3Res.amountBrl, quantity: b3Res.quantity, rejectionReason: b3Res.rejectionReason };
       if (phase === 'NO_NEW_POSITIONS' && risk.action === 'BUY') {
         risk = { action: 'HOLD', amountUsdt: 0, quantity: 0, rejectionReason: 'New positions are blocked for today' };
         await this.event('WARN', 'new_positions_blocked', 'BUY blocked during no-new-positions window', {
@@ -403,7 +436,21 @@ export class TradingService {
 
   private async forceClosePositionLocked(configuration: TradingConfiguration) {
     await this.repo.ensureAccount(configuration.initialBankUsdt);
-    const ready = await this.tradingReady();
+    let ready = await this.tradingReady();
+    if (!ready.ready) {
+      const blockedReason = ready.reason;
+      try {
+        await this.reconcileStateLocked('runtime');
+        ready = await this.tradingReady();
+      } catch (reconcileError) {
+        const recMsg = reconcileError instanceof Error ? reconcileError.message : 'Unknown reconciliation error';
+        await this.event('WARN', 'force_close_blocked', 'Forced close blocked pending reconciliation; runtime reconciliation attempt failed', {
+          reason: blockedReason,
+          reconcileError: recMsg,
+        });
+        return { action: 'HOLD' as const, reason: blockedReason };
+      }
+    }
     if (!ready.ready) {
       await this.event('WARN', 'force_close_blocked', 'Forced close blocked pending reconciliation', { reason: ready.reason });
       return { action: 'HOLD' as const, reason: ready.reason };
@@ -431,18 +478,19 @@ export class TradingService {
       pendingOrderDetails?: () => Promise<{ side: 'BUY' | 'SELL' } | null>;
     };
     const pending = pendingRepository.pendingOrderDetails ? await pendingRepository.pendingOrderDetails() : null;
-    const risk = applyRisk({
+    const closeRisk = applyB3Risk({
       action: 'SELL',
-      requestedUsdt: position.quantity * price,
+      requestedBrl: position.quantity * price,
       price,
-      account,
-      position,
+      account: { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt },
+      position: { ticker: config.SYMBOL, quantity: position.quantity, entryPrice: position.entryPrice, costBrl: position.costUsdt },
       rules,
       maxPositionPercent: configuration.maxPositionPercent,
       // A pending SELL is retried with its persisted client id below. A pending
       // BUY is never retried during the close-only window.
       duplicateOrderPending: pending ? pending.side !== 'SELL' : await this.repo.pendingOrder(),
     });
+    const risk = { action: closeRisk.action, amountUsdt: closeRisk.amountBrl, quantity: closeRisk.quantity, rejectionReason: closeRisk.rejectionReason };
     if (risk.action === 'HOLD') {
       await this.event('WARN', 'decision_rejected_by_risk', 'Forced close rejected by risk engine', {
         reason: risk.rejectionReason,
@@ -455,131 +503,6 @@ export class TradingService {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown force-close error';
       await this.event('ERROR', 'force_close_failed', 'Forced close failed and will be retried while the window is open', { error: message });
-      throw error;
-    }
-  }
-
-  async smokeTestTestnet() {
-    if (config.BINANCE_ENV !== 'testnet')
-      throw new Error('Smoke test refuses any Binance environment except testnet');
-    await this.repo.health();
-    const configuration = await this.operationalConfiguration();
-    await this.repo.ensureAccount(configuration.initialBankUsdt);
-    const initialAccount = await this.repo.account();
-    if (await this.repo.openPosition())
-      throw new Error('Smoke test aborted: a conceptual BTC position is already open');
-    if (initialAccount.cashUsdt <= 0) throw new Error('Smoke test aborted: conceptual cash is not positive');
-
-    let rules;
-    let price;
-    try {
-      [rules, price] = await Promise.all([this.exchange.rules(), this.exchange.price()]);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown Binance rules error';
-      await this.event(
-        'ERROR',
-        'external_service_error',
-        'Smoke test could not retrieve Binance Testnet rules',
-        { service: 'binance', error: message },
-      );
-      throw error;
-    }
-    const requestedUsdt = Math.min(6.5, initialAccount.cashUsdt);
-    if (requestedUsdt > initialAccount.cashUsdt)
-      throw new Error('Smoke test requested more than conceptual cash');
-    const risk = applyRisk({
-      action: 'BUY',
-      requestedUsdt,
-      price,
-      account: initialAccount,
-      position: null,
-      rules,
-      maxPositionPercent: configuration.maxPositionPercent,
-      duplicateOrderPending: await this.repo.pendingOrder(),
-    });
-    if (risk.action !== 'BUY') throw new Error(`Smoke test technical BUY rejected: ${risk.rejectionReason}`);
-
-    await this.event('INFO', 'smoke_test_started', 'Real Binance Spot Testnet smoke test started', {
-      symbol: config.SYMBOL,
-      requestedUsdt,
-      amountAfterRiskUsdt: risk.amountUsdt,
-    });
-    let positionOpened = false;
-    try {
-      const buyOrder = await this.submitAndPersistOrder('BUY', risk.quantity, risk.amountUsdt);
-      const buyAccounting = executionAccounting('BUY', buyOrder.executedQty, buyOrder.cummulativeQuoteQty, buyOrder.fills ?? []);
-      positionOpened = true;
-      const accountAfterBuy = await this.repo.account();
-      const positionAfterBuy = await this.repo.openPosition();
-      if (
-        !positionAfterBuy ||
-        positionAfterBuy.costUsdt <= 0 ||
-        accountAfterBuy.cashUsdt >= initialAccount.cashUsdt
-      )
-        throw new Error('Smoke test BUY persistence verification failed');
-
-      const close = await this.forceClosePosition();
-      const sellOrderId = 'orderId' in close && typeof close.orderId === 'string' ? close.orderId : null;
-      if (close.action !== 'SELL' || !sellOrderId)
-        throw new Error('Smoke test SELL did not close the position');
-      const finalAccount = await this.repo.account();
-      const finalPosition = await this.repo.openPosition();
-      const [orders, trades, events] = await Promise.all([
-        this.repo.orders(),
-        this.repo.trades(),
-        this.repo.events(),
-      ]);
-      const expectedEvents = ['order_submitted', 'order_executed', 'position_opened', 'position_closed'];
-      if (
-        finalPosition ||
-        orders.length < 2 ||
-        trades.length < 2 ||
-        !expectedEvents.every((type) => events.some((entry) => entry.event === type))
-      )
-        throw new Error('Smoke test final persistence verification failed');
-      const pnl = finalAccount.realizedPnlUsdt - initialAccount.realizedPnlUsdt;
-      const sellTrade = trades.find((trade) => trade.side === 'SELL');
-      await this.event('INFO', 'smoke_test_completed', 'Real Binance Spot Testnet smoke test completed', {
-        buyOrderId: buyOrder.orderId,
-        sellOrderId,
-        realizedPnlUsdt: pnl,
-      });
-      return {
-        initialCashUsdt: initialAccount.cashUsdt,
-        requestedUsdt,
-        buyGrossQuantity: buyOrder.executedQty,
-        buyFeesByAsset: buyAccounting.byAsset,
-        buyNetPositionQuantity: positionAfterBuy.quantity,
-        buyQuantity: buyOrder.executedQty,
-        buyCostUsdt: positionAfterBuy.costUsdt,
-        cashAfterBuy: accountAfterBuy.cashUsdt,
-        positionCostUsdt: positionAfterBuy.costUsdt,
-        sellQuantity: Number(sellTrade?.quantity ?? positionAfterBuy.quantity),
-        sellGrossReceivedUsdt: Number(sellTrade?.quote_amount ?? finalAccount.cashUsdt - accountAfterBuy.cashUsdt),
-        sellFeesByAsset: sellTrade?.fees_by_asset ?? {},
-        sellReceivedUsdt: Number(sellTrade?.net_quote_amount ?? finalAccount.cashUsdt - accountAfterBuy.cashUsdt),
-        grossPnlUsdt: Number(sellTrade?.gross_pnl_usdt ?? pnl),
-        netPnlUsdt: Number(sellTrade?.net_pnl_usdt ?? pnl),
-        tradePnlUsdt: pnl,
-        cashAfterSell: finalAccount.cashUsdt,
-        realizedPnlUsdt: finalAccount.realizedPnlUsdt,
-        orderCount: orders.length,
-        tradeCount: trades.length,
-      };
-    } catch (error) {
-      if (positionOpened && (await this.repo.openPosition())) {
-        try {
-          await this.forceClosePosition();
-        } catch (closeError) {
-          logger.error({ err: closeError }, 'Smoke test cleanup could not close conceptual position');
-        }
-      }
-      const message = error instanceof Error ? error.message : 'Unknown smoke test error';
-      try {
-        await this.event('ERROR', 'unexpected_error', 'Smoke test failed', { error: message });
-      } catch (eventError) {
-        logger.error({ err: eventError }, 'Could not persist smoke test failure');
-      }
       throw error;
     }
   }

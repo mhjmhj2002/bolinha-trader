@@ -1,13 +1,13 @@
 import { config, defaultTradingConfiguration, logger, sessionPhase, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
 import { TradingRepository } from '@bolinha/database';
-import { BinanceTestnetClient } from '@bolinha/exchange';
+import { createBrokerGateway } from '@bolinha/exchange';
 import { TradingService } from './service.js';
 import { finishDailyIfPositionClosed, isCloseOnlyPhase } from './lifecycle.js';
 import { nextCycleAt, reconciliationRetryDelay } from './scheduler.js';
 
 const repo = new TradingRepository();
 const service = new TradingService(repo);
-const exchange = new BinanceTestnetClient(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, config.SYMBOL, undefined, config.BINANCE_RECV_WINDOW_MS);
+const exchange = createBrokerGateway(config.SYMBOL);
 let stopped = false;
 let timer: NodeJS.Timeout | undefined;
 let startupReconciled = false;
