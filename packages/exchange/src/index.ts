@@ -23,15 +23,18 @@ export interface BrokerGateway {
   candles(interval: '1m' | '5m' | '15m', limit?: number): Promise<Candle[]>;
   rules(): Promise<SymbolRules>;
   price(): Promise<number>;
-  placeMarketOrder(side: 'BUY' | 'SELL', quantity: number, clientOrderId: string): Promise<ExchangeOrder>;
+  placeMarketOrder(side: 'BUY' | 'SELL', quantity: number, clientOrderId: string, minPrice?: number): Promise<ExchangeOrder>;
   pingPublic(): Promise<boolean>;
   pingPrivate(): Promise<boolean>;
   orderByClientId(clientOrderId: string): Promise<ExchangeOrder | null>;
 }
-import { B3PaperBroker } from './b3/index.js';
+import { B3PaperBroker, defaultB3MarketDataService, B3MarketDataService } from './b3/index.js';
 export * from './b3/index.js';
 
 /** Cria o broker da B3 (paper trading) para o ticker informado. */
-export function createBrokerGateway(ticker: string = 'PETR4'): BrokerGateway {
-  return new B3PaperBroker(ticker);
+export function createBrokerGateway(
+  ticker: string = 'PETR4',
+  marketData: B3MarketDataService = defaultB3MarketDataService,
+): BrokerGateway {
+  return new B3PaperBroker(ticker, 100.0, marketData);
 }

@@ -219,4 +219,59 @@ describe('one trading cycle', () => {
     expect(events).toContain('pending_order_reconciled');
     expect(events).toContain('reconciliation_completed');
   });
+
+  it('blocks SELL decision with HOLD via Slippage Guard when broker price is significantly below snapshot price', async () => {
+    const events: Array<{ type: string; metadata?: any }> = [];
+    let savedDecisionAction: string | null = null;
+    let orderPlaced = false;
+
+    // Posição comprada a R$ 30.00
+    const position = { id: 1, ticker: 'PETR4', quantity: 3, entryPrice: 30.0, costUsdt: 90.0, openedAt: new Date() };
+
+    const repo = {
+      ensureAccount: async () => {},
+      heartbeat: async () => {},
+      account: async () => ({ initialBankUsdt: 100, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => position,
+      pendingOrder: async () => false,
+      saveSnapshot: async () => 1,
+      saveDecision: async (_d: any, _u: any, action: string) => {
+        savedDecisionAction = action;
+        return 1;
+      },
+      event: async (_sev: string, type: string, _msg: string, metadata?: any) => {
+        events.push({ type, metadata });
+      },
+    };
+
+    // Snapshot indica fechamento em R$ 31.00 (+3.3% de lucro)
+    const candles31 = candles.map((c) => ({ ...c, close: 31.0 }));
+
+    // Mas no momento da execução, o broker reporta R$ 29.80 (queda para prejuízo)
+    const exchange = {
+      candles: async () => candles31,
+      rules: async () => ({ minNotional: 1, minQty: 1, stepSize: 1 }),
+      price: async () => 29.80, // Preço desabou abaixo de snapshot e de entry
+      placeMarketOrder: async () => {
+        orderPlaced = true;
+        throw new Error('Must not place order');
+      },
+      orderByClientId: async () => null,
+    };
+
+    const ai = {
+      decide: async () => ({
+        decision: { action: 'SELL' as const, amountUsdt: 93.0, confidence: 0.95, reason: 'take profit at 31', rawResponse: null },
+        usage: { modelRequested: 'test-model', latencyMs: 50, promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, error: null, fallbackUsed: false },
+      }),
+    };
+
+    const service = new TradingService(repo as never, exchange as never, ai as never);
+    const result = await service.runOnce(new Date('2026-10-01T12:00:00Z'));
+
+    expect(result.action).toBe('HOLD');
+    expect(savedDecisionAction).toBe('HOLD');
+    expect(orderPlaced).toBe(false);
+    expect(events.some(e => e.type === 'decision_rejected_by_risk' && String(e.metadata?.brokerPrice) === '29.8')).toBe(true);
+  });
 });

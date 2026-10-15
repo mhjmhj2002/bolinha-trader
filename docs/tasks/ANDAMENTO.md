@@ -8,6 +8,8 @@ Este documento consolida a rastreabilidade e status de todas as tarefas e demand
 
 | Identificador | Título / Demanda | Tipo | Status | Localização |
 |---|---|---|---|---|
+| **BUG-04** | Sincronização de Preço entre Paper Broker e Market Data e Prevenção de Gap na Execução | Bug | **done** | [`docs/tasks/bug/historico/BUG-04-sincronizacao-preco-paper-broker-e-market-data.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-04-sincronizacao-preco-paper-broker-e-market-data.md) |
+| **BUG-05** | Normalização do Gerador Sintético de Candles e Correção de Saturação do RSI em 100 | Bug | **done** | [`docs/tasks/bug/historico/BUG-05-normalizacao-gerador-candles-e-rsi.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-05-normalizacao-gerador-candles-e-rsi.md) |
 | **BUG-03** | Colisão de Order ID na Reinicialização do Paper Broker e Dimensionamento de Banca Fracionada | Bug | **done** | [`docs/tasks/bug/historico/BUG-03-colisao-order-id-paper-e-dimensionamento-banca.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-03-colisao-order-id-paper-e-dimensionamento-banca.md) |
 | **BUG-01** | Rejeição de Ordem Binance Testnet (HTTP 400 -1021 recvWindow) e Bloqueio de Ciclos | Bug | **done** | [`docs/tasks/bug/historico/BUG-01-binance-recvwindow-e-ordem-pendente.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-01-binance-recvwindow-e-ordem-pendente.md) |
 | **BUG-02** | Reconciliação Contínua e Tratamento Robusto de Falha de Rede na Submissão de Ordens | Bug | **done** | [`docs/tasks/bug/historico/BUG-02-reconciliacao-continua-e-falha-de-rede.md`](file:///home/mhj/git/bolinha-trader/docs/tasks/bug/historico/BUG-02-reconciliacao-continua-e-falha-de-rede.md) |

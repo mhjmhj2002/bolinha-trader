@@ -191,7 +191,12 @@ export class TradingService {
     }
   }
 
-  private async submitAndPersistOrder(side: 'BUY' | 'SELL', quantity: number, amountUsdt: number) {
+  private async submitAndPersistOrder(
+    side: 'BUY' | 'SELL',
+    quantity: number,
+    amountUsdt: number,
+    minPrice?: number,
+  ) {
     const pendingRepository = this.repo as TradingRepository & {
       pendingOrderDetails?: () => Promise<{
         id: number;
@@ -225,7 +230,7 @@ export class TradingService {
             side,
             quantity,
           });
-        order = await this.exchange.placeMarketOrder(side, quantity, clientOrderId);
+        order = await this.exchange.placeMarketOrder(side, quantity, clientOrderId, minPrice);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown order submission error';
@@ -384,6 +389,38 @@ export class TradingService {
           requestedAction: response.decision.action,
         });
       }
+
+      let sellMinPrice: number | undefined;
+      if (risk.action === 'SELL') {
+        // Slippage Guard:
+        // A decisão de venda da IA foi tomada baseada no snapshot de 1m (currentPrice).
+        // Não permitir execução em patamar desfavorável em relação ao snapshot (tolerância de até 1%).
+        const maxAdverseSlippagePct = 0.01;
+        let minAcceptable = Number((currentPrice * (1 - maxAdverseSlippagePct)).toFixed(2));
+
+        // Se a posição estava em lucro no snapshot (currentPrice > entryPrice),
+        // proteger contra reversão em prejuízo inesperado por gap de execução.
+        if (b3Position && currentPrice > b3Position.entryPrice) {
+          const breakEvenPrice = Number((b3Position.entryPrice * 1.0006).toFixed(2));
+          minAcceptable = Math.max(minAcceptable, Math.min(Number((currentPrice * 0.995).toFixed(2)), breakEvenPrice));
+        }
+
+        sellMinPrice = minAcceptable;
+
+        // Pré-validação com a cotação mais recente do broker
+        const latestPrice = typeof this.exchange.price === 'function' ? await this.exchange.price() : currentPrice;
+        if (latestPrice < minAcceptable) {
+          const reason = `Slippage guard: market price R$ ${latestPrice.toFixed(2)} is below minimum acceptable R$ ${minAcceptable.toFixed(2)} (snapshot: R$ ${currentPrice.toFixed(2)})`;
+          risk = { action: 'HOLD', amountUsdt: 0, quantity: 0, rejectionReason: reason };
+          await this.event('WARN', 'decision_rejected_by_risk', 'SELL blocked by slippage guard to prevent unexpected loss', {
+            brokerPrice: latestPrice,
+            snapshotPrice: currentPrice,
+            minAcceptablePrice: minAcceptable,
+            entryPrice: b3Position?.entryPrice,
+          });
+        }
+      }
+
       await this.repo.saveDecision(
         response.decision,
         response.usage,
@@ -411,7 +448,7 @@ export class TradingService {
         });
         return { action: 'HOLD' as const, reason: risk.rejectionReason };
       }
-      const order = await this.submitAndPersistOrder(risk.action, risk.quantity, risk.amountUsdt);
+      const order = await this.submitAndPersistOrder(risk.action, risk.quantity, risk.amountUsdt, sellMinPrice);
       await this.event('INFO', 'cycle_completed', 'Trading cycle completed with an order', {
         action: risk.action,
         orderId: order.orderId,

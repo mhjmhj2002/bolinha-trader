@@ -104,6 +104,7 @@ export class B3MetaTraderBridge implements BrokerGateway {
     side: 'BUY' | 'SELL',
     quantity: number,
     clientOrderId: string,
+    minPrice?: number,
   ): Promise<ExchangeOrder> {
     try {
       const response = await this.fetchFn(`${this.url}/api/v1/order`, {
@@ -115,6 +116,7 @@ export class B3MetaTraderBridge implements BrokerGateway {
           quantity,
           clientOrderId,
           type: 'MARKET',
+          ...(minPrice !== undefined ? { minPrice } : {}),
         }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
@@ -123,7 +125,14 @@ export class B3MetaTraderBridge implements BrokerGateway {
         throw new Error(`MT5 Bridge order submission error: HTTP ${response.status} ${errorBody?.message ?? ''}`);
       }
       const data = await response.json();
-      return this.mapOrder(data);
+      const order = this.mapOrder(data);
+      if (side === 'SELL' && minPrice !== undefined) {
+        const fillPrice = order.fills[0]?.price ?? (order.cummulativeQuoteQty / order.executedQty);
+        if (fillPrice < minPrice) {
+          throw new Error(`Execution price R$ ${fillPrice.toFixed(2)} is below minimum allowed price R$ ${minPrice.toFixed(2)} (slippage guard)`);
+        }
+      }
+      return order;
     } catch (error) {
       throw new Error(`MT5 Bridge order failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     }

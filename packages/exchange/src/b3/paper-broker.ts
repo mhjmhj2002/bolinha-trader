@@ -3,7 +3,7 @@ import type { Candle } from '@bolinha/market-data';
 import type { SymbolRules } from '@bolinha/core';
 import type { BrokerGateway, ExchangeOrder, ExchangeFill } from '../index.js';
 import { calculateB3Fees, getB3SymbolRules, parseB3Ticker } from './types.js';
-import { B3MarketDataService } from './market-data.js';
+import { B3MarketDataService, defaultB3MarketDataService } from './market-data.js';
 
 export interface B3PaperAccount {
   initialBankBrl: number;
@@ -28,7 +28,7 @@ export class B3PaperBroker implements BrokerGateway {
   constructor(
     private ticker: string = 'PETR4',
     initialBankBrl = 100.0,
-    private marketData: B3MarketDataService = new B3MarketDataService(),
+    private marketData: B3MarketDataService = defaultB3MarketDataService,
     private slippagePct = 0.0005, // 0.05% slippage simulado
   ) {
     this.accountState = {
@@ -36,6 +36,10 @@ export class B3PaperBroker implements BrokerGateway {
       cashBrl: initialBankBrl,
       realizedPnlBrl: 0,
     };
+  }
+
+  getMarketData(): B3MarketDataService {
+    return this.marketData;
   }
 
   getAccount(): B3PaperAccount {
@@ -74,6 +78,7 @@ export class B3PaperBroker implements BrokerGateway {
     side: 'BUY' | 'SELL',
     quantity: number,
     clientOrderId: string,
+    minPrice?: number,
   ): Promise<ExchangeOrder> {
     const rules = await this.rules();
     if (quantity < rules.minQty) {
@@ -86,6 +91,13 @@ export class B3PaperBroker implements BrokerGateway {
     const currentPrice = await this.price();
     const slippageFactor = side === 'BUY' ? (1 + this.slippagePct) : (1 - this.slippagePct);
     const executionPrice = Number((currentPrice * slippageFactor).toFixed(2));
+
+    if (side === 'SELL' && minPrice !== undefined && executionPrice < minPrice) {
+      throw new Error(
+        `Execution price R$ ${executionPrice.toFixed(2)} is below minimum allowed price R$ ${minPrice.toFixed(2)} (slippage guard)`,
+      );
+    }
+
     const grossFinancial = Number((executionPrice * quantity).toFixed(2));
     const commission = calculateB3Fees(grossFinancial);
 

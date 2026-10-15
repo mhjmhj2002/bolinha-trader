@@ -6,8 +6,8 @@ import { finishDailyIfPositionClosed, isCloseOnlyPhase } from './lifecycle.js';
 import { nextCycleAt, reconciliationRetryDelay } from './scheduler.js';
 
 const repo = new TradingRepository();
-const service = new TradingService(repo);
 const exchange = createBrokerGateway(config.SYMBOL);
+const service = new TradingService(repo, exchange);
 let stopped = false;
 let timer: NodeJS.Timeout | undefined;
 let startupReconciled = false;

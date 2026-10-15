@@ -10,6 +10,7 @@ import {
 } from '@bolinha/exchange';
 import { applyB3Risk } from '@bolinha/risk-engine';
 import { buildB3Prompt } from '@bolinha/ai';
+import { calculateIndicators } from '@bolinha/market-data';
 
 describe('B3 Stock Day Trade & Connector Suite', () => {
   describe('B3 Tickers and Rules', () => {
@@ -259,6 +260,111 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       expect(prompt).toContain('R$ 35.00');
       expect(prompt).toContain('+2.86%');
       expect(prompt).toContain('Risco:Retorno mínima 2:1');
+    });
+  });
+
+  describe('BUG-04: Price Sync and Slippage Guard', () => {
+    it('synchronizes currentPrice with the close of the last candle and executes orders at that price', async () => {
+      const marketData = new B3MarketDataService();
+      const broker = new B3PaperBroker('PETR4', 1000.0, marketData, 0.0005);
+
+      const candles = await broker.candles('1m', 50);
+      expect(candles.length).toBe(50);
+      const lastCandleClose = candles[candles.length - 1].close;
+
+      const currentPrice = await broker.price();
+      expect(currentPrice).toBe(lastCandleClose);
+
+      // Ordem a mercado de compra executa no fechamento do candle + slippage (0.05%)
+      const expectedBuyPrice = Number((lastCandleClose * 1.0005).toFixed(2));
+      const buyOrder = await broker.placeMarketOrder('BUY', 1, 'sync-buy-1');
+      expect(buyOrder.fills[0].price).toBe(expectedBuyPrice);
+    });
+
+    it('shares market data instance across broker gateways created via createBrokerGateway', async () => {
+      const broker1 = new B3PaperBroker('VALE3', 1000.0);
+      const broker2 = new B3PaperBroker('VALE3', 1000.0);
+
+      // Ambos devem compartilhar a mesma referência do serviço de dados de mercado
+      expect(broker1.getMarketData()).toBe(broker2.getMarketData());
+
+      broker1.getMarketData().setMockPrice('VALE3', 65.50);
+      expect(await broker2.price()).toBe(65.50);
+    });
+
+    it('rejects SELL order when execution price falls below minPrice (slippage guard)', async () => {
+      const marketData = new B3MarketDataService();
+      marketData.setMockPrice('PETR4', 30.00);
+      const broker = new B3PaperBroker('PETR4', 1000.0, marketData, 0.001); // 0.1% slippage
+
+      await broker.placeMarketOrder('BUY', 10, 'buy-for-slippage');
+
+      // Preço de venda a mercado esperado com 0.1% de slippage: 30.00 * 0.999 = 29.97
+      // Se minPrice for 29.98, deve rejeitar
+      await expect(
+        broker.placeMarketOrder('SELL', 10, 'sell-rejected', 29.98),
+      ).rejects.toThrow(/Execution price R\$ 29\.97 is below minimum allowed price R\$ 29\.98 \(slippage guard\)/);
+
+      // Se minPrice for 29.97 ou menor, deve aprovar
+      const approvedOrder = await broker.placeMarketOrder('SELL', 10, 'sell-approved', 29.97);
+      expect(approvedOrder.status).toBe('FILLED');
+      expect(approvedOrder.fills[0].price).toBe(29.97);
+    });
+  });
+
+  describe('BUG-05: Synthetic Candle Generator Normalization & RSI Oscillation', () => {
+    it('generates realistic candles with temporal continuity and price sanity', async () => {
+      const marketData = new B3MarketDataService();
+      const candles = await marketData.candles('PETR4', '1m', 50);
+
+      expect(candles.length).toBe(50);
+      for (let i = 1; i < candles.length; i++) {
+        const prev = candles[i - 1];
+        const curr = candles[i];
+        // Coerência temporal do candle
+        expect(curr.openTime).toBeGreaterThan(prev.openTime);
+        expect(curr.closeTime).toBeGreaterThan(curr.openTime);
+        // Preço de abertura deve ser coerente com fechamento anterior
+        expect(curr.open).toBe(prev.close);
+        // High deve ser >= max(open, close) e Low <= min(open, close)
+        expect(curr.high).toBeGreaterThanOrEqual(Math.max(curr.open, curr.close));
+        expect(curr.low).toBeLessThanOrEqual(Math.min(curr.open, curr.close));
+        // Volume positivo
+        expect(curr.volume).toBeGreaterThan(0);
+      }
+    });
+
+    it('produces dynamic RSI oscillation across 1m, 5m and 15m intervals without sticking to 100', async () => {
+      const marketData = new B3MarketDataService();
+      marketData.setMockPrice('PETR4', 30.0);
+
+      const [c1m, c5m, c15m] = await Promise.all([
+        marketData.candles('PETR4', '1m', 60),
+        marketData.candles('PETR4', '5m', 60),
+        marketData.candles('PETR4', '15m', 60),
+      ]);
+
+      const ind1m = calculateIndicators(c1m);
+      const ind5m = calculateIndicators(c5m);
+      const ind15m = calculateIndicators(c15m);
+
+      // Nenhum dos intervalos deve ficar fixado em 100.00
+      expect(ind1m.rsi14).toBeLessThan(99.0);
+      expect(ind1m.rsi14).toBeGreaterThan(1.0);
+
+      expect(ind5m.rsi14).toBeLessThan(99.0);
+      expect(ind5m.rsi14).toBeGreaterThan(1.0);
+
+      expect(ind15m.rsi14).toBeLessThan(99.0);
+      expect(ind15m.rsi14).toBeGreaterThan(1.0);
+
+      // Comprova que há candles de alta e candles de baixa (distribuição estocástica)
+      const diffs1m = c1m.slice(1).map((c, i) => c.close - c1m[i].close);
+      const positiveCandles = diffs1m.filter((d) => d > 0).length;
+      const negativeCandles = diffs1m.filter((d) => d < 0).length;
+
+      expect(positiveCandles).toBeGreaterThan(10);
+      expect(negativeCandles).toBeGreaterThan(10);
     });
   });
 });
