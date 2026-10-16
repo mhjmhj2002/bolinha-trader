@@ -37,18 +37,33 @@
   function renderMetrics(payload) {
     const { account, performance, position, trades, aiUsage, eventCounts } = payload;
     $('metric-bank').textContent = money(account.equityUsdt);
+    const sharesValue = account.positionMarketValueUsdt ?? (position ? position.quantity * position.price : 0);
+    $('metric-bank-breakdown').textContent = `Caixa: ${money(account.cashUsdt)} · Ações: ${money(sharesValue)}`;
     $('metric-initial').textContent = `Inicial: ${money(account.initialBankUsdt)}`;
+
+    $('metric-cash').textContent = money(account.cashUsdt);
+    if ($('metric-cash-detail')) {
+      const price = position?.price ?? (payload.position?.price ?? null);
+      if (price && price > 0 && account.cashUsdt !== null) {
+        const canBuy = Math.floor(account.cashUsdt / price);
+        $('metric-cash-detail').textContent = `Comportamento: até ${canBuy} ação(ões)`;
+      } else {
+        $('metric-cash-detail').textContent = 'Disponível para compras';
+      }
+    }
+
     $('metric-pnl').textContent = signedMoney(performance.netPnlUsdt);
     $('metric-pnl').className = `metric-value ${Number(performance.netPnlUsdt) < 0 ? 'text-danger' : Number(performance.netPnlUsdt) > 0 ? 'text-success' : ''}`;
+    $('metric-pnl-breakdown').textContent = `Real: ${signedMoney(performance.realizedPnlUsdt)} · Flut: ${signedMoney(performance.unrealizedPnlUsdt)}`;
     $('metric-return').textContent = performance.returnPct === null ? '—' : `${Number(performance.returnPct) >= 0 ? '+' : ''}${number(performance.returnPct)}%`;
+
     $('metric-position').textContent = position ? `${position.symbol} ${number(position.quantity, 8)}` : 'SEM POSIÇÃO';
-    $('metric-position-detail').textContent = position ? `Custo: ${money(position.costUsdt)}` : '—';
+    $('metric-position-detail').textContent = position ? `Custo: ${money(position.costUsdt)} (Médio: ${money(position.costUsdt / position.quantity)})` : '—';
     $('metric-trades').textContent = String(trades.length);
+
     $('metric-ai-cost').textContent = money(account.aiCostUsd, 'US$', 4);
-    $('metric-tokens').textContent = `${number(aiUsage.totalTokens, 0)} tokens`;
-    $('metric-errors').textContent = String(eventCounts.errors);
-    $('metric-errors').className = `metric-value ${eventCounts.errors ? 'text-danger' : 'text-success'}`;
-    $('metric-fallbacks').textContent = `${aiUsage.fallbacks} fallback(s)`;
+    $('metric-ai-detail').textContent = `${number(aiUsage.totalTokens, 0)} tok · ${eventCounts.errors} err · ${aiUsage.fallbacks} fbk`;
+    $('metric-ai-cost').className = `metric-value compact ${eventCounts.errors ? 'text-danger' : ''}`;
   }
   function renderCharts(payload) {
     const labels = payload.equityHistory.map((point) => time(point.at));

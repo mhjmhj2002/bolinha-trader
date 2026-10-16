@@ -10,13 +10,23 @@ describe('AI parser', () => {
     expect(parseAiContent(null).action).toBe('HOLD');
     expect(parseAiContent('{"acao":"BAD"}').action).toBe('HOLD');
   });
-  it('uses fallback after invalid response', async () => {
+  it('uses fallback after invalid response and captures fallbackReason', async () => {
     let n = 0;
-    const fetchFn = async () => new Response(n++ === 0 ? '{"choices":[{"message":{"content":null}}]}' : '{"model":"two","choices":[{"message":{"content":"{\\"acao\\":\\"HOLD\\",\\"valor_usdt\\":0,\\"confianca\\":1,\\"motivo\\":\\"x\\"}"}}]}', { status: 200 });
-    const result = await new OpenRouterClient('key', ['one', 'two'], fetchFn as typeof fetch).decide('x');
+    const fetchFn = async () =>
+      new Response(
+        n++ === 0
+          ? '{"choices":[{"message":{"content":null}}]}'
+          : '{"model":"google/gemini-2.0-flash-001","choices":[{"message":{"content":"{\\"acao\\":\\"HOLD\\",\\"valor_usdt\\":0,\\"confianca\\":1,\\"motivo\\":\\"x\\"}"}}]}',
+        { status: 200 },
+      );
+    const client = new OpenRouterClient('key', ['google/gemini-2.5-flash', 'google/gemini-2.0-flash-001'], fetchFn as typeof fetch);
+    const result = await client.decide('x');
     expect(result.decision.action).toBe('HOLD');
-    expect(result.usage.modelRequested).toBe('two');
+    expect(result.usage.modelRequested).toBe('google/gemini-2.0-flash-001');
+    expect(result.usage.fallbackUsed).toBe(true);
+    expect(result.usage.fallbackReason).toContain('Triggered after prior model failure');
   });
+
   it('respects custom timeout and handles abort', async () => {
     let receivedSignal: AbortSignal | undefined;
     const fetchFn = async (_url: string | URL | Request, init?: RequestInit) => {
@@ -25,7 +35,7 @@ describe('AI parser', () => {
       error.name = 'TimeoutError';
       throw error;
     };
-    const client = new OpenRouterClient('key', ['model-a'], fetchFn as typeof fetch, 45_000);
+    const client = new OpenRouterClient('key', ['google/gemini-2.5-flash'], fetchFn as typeof fetch, 45_000);
     const result = await client.decide('prompt');
     expect(receivedSignal).toBeDefined();
     expect(result.decision.action).toBe('HOLD');

@@ -481,7 +481,7 @@ export class TradingRepository {
         usage.totalTokens,
         usage.costUsd,
         usage.latencyMs,
-        usage.error,
+        usage.error ?? (usage.fallbackUsed ? usage.fallbackReason : null),
       ],
     );
     if (usage.costUsd)
@@ -1012,7 +1012,14 @@ export class TradingRepository {
     return {
       schedule: { timezone: schedule.timezone, startTime: schedule.start, stopNewPositionsTime: schedule.stopNewPositions, forceCloseTime: schedule.forceClose, endTime: schedule.end, intervalSeconds: schedule.intervalSeconds },
       session: session && { day, phase: String(session.phase), timezone: String(session.timezone), startedAt: session.started_at ? new Date(String(session.started_at)).toISOString() : null, finishedAt: session.finished_at ? new Date(String(session.finished_at)).toISOString() : null, lastCycleAt: session.last_cycle_at ? new Date(String(session.last_cycle_at)).toISOString() : null, nextCycleAt: session.next_cycle_at ? new Date(String(session.next_cycle_at)).toISOString() : null, cyclesToday: num(session.cycles_today) },
-      account: { initialBankUsdt, cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null), equityUsdt: finalEquity, aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd) },
+      account: {
+        initialBankUsdt,
+        cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null),
+        equityUsdt: finalEquity,
+        positionCostUsdt: latest?.positionQuantity && latest?.positionCostUsdt ? latest.positionCostUsdt : 0,
+        positionMarketValueUsdt: latest?.positionQuantity && latest?.price ? Number((latest.positionQuantity * latest.price).toFixed(2)) : 0,
+        aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd),
+      },
       performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt, returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
       position: latest?.positionQuantity ? { symbol: config.SYMBOL, quantity: latest.positionQuantity, costUsdt: latest.positionCostUsdt, price: latest.price } : null,
       decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), brokerOrderId: row.broker_order_id })),

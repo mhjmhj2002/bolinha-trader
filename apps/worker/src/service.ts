@@ -21,6 +21,7 @@ export class TradingService {
       undefined,
       config.OPENROUTER_TIMEOUT_MS,
     ),
+    private positionHighWatermark = new Map<string, number>(),
   ) {}
 
   private async event(severity: Severity, type: string, message: string, metadata?: unknown) {
@@ -347,12 +348,32 @@ export class TradingService {
         await dashboardRepo.saveAccountSnapshot(snapshot.intervals['1m'].price, at);
       const currentPrice = snapshot.intervals['1m'].price;
       const b3Account = { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt };
-      const b3Position = position ? { ticker: config.SYMBOL, quantity: position.quantity, entryPrice: position.entryPrice, costBrl: position.costUsdt } : null;
+      const symbol = config.SYMBOL.toUpperCase();
+      let highest = this.positionHighWatermark.get(symbol);
+      if (position) {
+        highest = Math.max(highest ?? position.entryPrice, currentPrice);
+        this.positionHighWatermark.set(symbol, highest);
+      } else {
+        this.positionHighWatermark.delete(symbol);
+      }
 
-      const response = await this.ai.decide(buildB3Prompt(snapshot, b3Account, b3Position, currentPrice));
+      const b3Position = position
+        ? {
+            ticker: config.SYMBOL,
+            quantity: position.quantity,
+            entryPrice: position.entryPrice,
+            costBrl: position.costUsdt,
+            highestPrice: highest,
+          }
+        : null;
+
+      const response = await this.ai.decide(
+        buildB3Prompt(snapshot, b3Account, b3Position, currentPrice, config.STOP_LOSS_PCT),
+      );
       if (response.usage.fallbackUsed)
         await this.event('WARN', 'ai_fallback', 'OpenRouter fallback model was used', {
           model: response.usage.modelRequested,
+          reason: response.usage.fallbackReason ?? 'Previous model failed',
         });
       if (response.usage.error)
         await this.event('ERROR', 'ai_error', 'OpenRouter did not return a usable decision', {
@@ -369,6 +390,9 @@ export class TradingService {
         maxPositionPercent: configuration.maxPositionPercent,
         duplicateOrderPending: pending,
         isDayTradeCloseOnly: phase === 'NO_NEW_POSITIONS',
+        maxStopLossPct: config.MAX_STOP_LOSS_PCT, // Proteção rígida intradiária calibrada
+        breakevenTriggerPct: 0.008, // Ativa breakeven ao atingir +0.8%
+        trailingStopPct: 0.006, // Trailing stop de 0.6% a partir do topo
       });
       let risk = { action: b3Res.action, amountUsdt: b3Res.amountBrl, quantity: b3Res.quantity, rejectionReason: b3Res.rejectionReason };
       if (phase === 'NO_NEW_POSITIONS' && risk.action === 'BUY') {

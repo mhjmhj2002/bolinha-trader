@@ -9,9 +9,11 @@ const configSchema = z.object({
   DATABASE_URL: z.string().url().default('postgres://bolinha:bolinha@localhost:5432/bolinha'),
   API_HOST: z.string().default('127.0.0.1'), API_PORT: numeric(3000),
   OPENROUTER_API_KEY: z.string().default(''),
-  OPENROUTER_MODELS: z.string().default('google/gemini-2.0-flash-exp:free,meta-llama/llama-3.3-70b-instruct:free,mistralai/mistral-small-24b-instruct-2501:free,qwen/qwen3.8-27b:free,openrouter/free'),
+  OPENROUTER_MODELS: z.string().default('google/gemini-2.5-flash,google/gemini-2.0-flash-001,deepseek/deepseek-chat,meta-llama/llama-3.3-70b-instruct,mistralai/mistral-small-24b-instruct-2501'),
   OPENROUTER_TIMEOUT_MS: numeric(30_000),
   INTERVAL_SECONDS: numeric(180),
+  STOP_LOSS_PCT: numeric(0.012),
+  MAX_STOP_LOSS_PCT: numeric(0.018),
   SYMBOL: z.string().default('PETR4'), TRADING_LOOP_ENABLED: bool,
 });
 export type Config = z.infer<typeof configSchema>;

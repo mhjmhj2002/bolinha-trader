@@ -26,7 +26,14 @@ describe('dashboard/data aggregation', () => {
 
     const data = await repo.dashboardData('2026-09-30');
 
-    expect(data.performance).toMatchObject({ netPnlUsdt: 0.5, returnPct: 2.5 });
+    expect(data.account).toMatchObject({
+      initialBankUsdt: 20,
+      cashUsdt: 10,
+      equityUsdt: 20.5,
+      positionCostUsdt: 10,
+      positionMarketValueUsdt: 10.5,
+    });
+    expect(data.performance).toMatchObject({ realizedPnlUsdt: 0.2, unrealizedPnlUsdt: 0.5, netPnlUsdt: 0.5, returnPct: 2.5 });
     expect(data.position).toMatchObject({ symbol: config.SYMBOL.replace('USDT', ''), quantity: 0.0001 });
     expect(data.decisionCounts).toEqual({ BUY: 0, SELL: 1, HOLD: 1, rejectedByRisk: 1 });
     expect(data.aiUsage).toMatchObject({ fallbacks: 1, totalTokens: 70, totalCostUsd: 0.0021 });

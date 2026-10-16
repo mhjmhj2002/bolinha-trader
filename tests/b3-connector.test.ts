@@ -246,7 +246,7 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
     });
   });
 
-  describe('B3 AI Prompt Builder', () => {
+  describe('B3 AI Prompt Builder & Dynamic Targets', () => {
     it('includes B3 context, entry price, profit ratio and BRL currency', () => {
       const prompt = buildB3Prompt(
         {} as any,
@@ -260,6 +260,145 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       expect(prompt).toContain('R$ 35.00');
       expect(prompt).toContain('+2.86%');
       expect(prompt).toContain('Risco:Retorno mínima 2:1');
+      expect(prompt).toContain('PROTEÇÃO DE BREAKEVEN ATIVA');
+      expect(prompt).toContain('Stop Loss Efetivo: R$ 35.02');
+      expect(prompt).toContain('Take Profit Parcial (+1,0%): R$ 35.35');
+      expect(prompt).toContain('Take Profit Total (+2,0%): R$ 35.70');
+      expect(prompt).toContain('proibido ficar em HOLD passivo');
+    });
+
+    it('allows custom stop loss calibration in buildB3Prompt', () => {
+      const prompt = buildB3Prompt(
+        {} as any,
+        { initialBankBrl: 100, cashBrl: 50 },
+        { ticker: 'PETR4', quantity: 2, entryPrice: 30.0, costBrl: 60 },
+        29.8,
+        0.015, // 1.5%
+      );
+      expect(prompt).toContain('Stop Loss Inicial (-1,5%): R$ 29.55');
+      expect(prompt).toContain('Stop Loss Efetivo: R$ 29.55');
+      expect(prompt).toContain('Alvo +1,0% a +2,5% com stop ~-1,0% a -1,5%');
+    });
+
+    const rules = getB3SymbolRules('PETR4F'); // fractional lot: 1 share
+
+    it('forces SELL protection in applyB3Risk if position exceeds maxStopLossPct even if AI returns HOLD', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      const position = { ticker: 'PETR4', quantity: 2, entryPrice: 35.0, costBrl: 70.0 };
+      const currentPrice = 34.0; // Perda de (35 - 34)/35 = 2.85% (> 1.5% maxStopLossPct)
+
+      const result = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: currentPrice,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        maxStopLossPct: 0.015,
+      });
+
+      expect(result.action).toBe('SELL');
+      expect(result.quantity).toBe(2);
+      expect(result.amountBrl).toBe(68.0);
+      expect(result.rejectionReason).toContain('Automatic stop loss triggered');
+    });
+
+    it('blocks BUY in applyB3Risk if position exceeds maxStopLossPct', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      const position = { ticker: 'PETR4', quantity: 2, entryPrice: 35.0, costBrl: 70.0 };
+      const currentPrice = 34.0;
+
+      const result = applyB3Risk({
+        action: 'BUY',
+        requestedBrl: 30,
+        price: currentPrice,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        maxStopLossPct: 0.015,
+      });
+
+      expect(result.action).toBe('HOLD');
+      expect(result.rejectionReason).toContain('BUY rejected: position hit maximum intradiary stop loss');
+    });
+
+    it('triggers Breakeven protection in applyB3Risk when position reached >= breakevenTriggerPct and reverts to cost', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      // Comprou a R$ 30.00, subiu até R$ 30.50 (+1.66% > 0.8% gatilho de breakeven)
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+        highestPrice: 30.50,
+      };
+
+      // Agora o preço recua para R$ 30.00 (preço de entrada com taxas)
+      const result = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 30.00,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        breakevenTriggerPct: 0.008,
+      });
+
+      // Deve forçar SELL para não devolver ganhos e virar prejuízo
+      expect(result.action).toBe('SELL');
+      expect(result.quantity).toBe(2);
+      expect(result.amountBrl).toBe(60.00);
+      expect(result.rejectionReason).toContain('Automatic breakeven/trailing stop triggered');
+    });
+
+    it('protects gains with Trailing Stop from highest price reached', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      // Comprou a R$ 30.00, subiu até R$ 31.00 (+3.33%). Trailing stop de 0.6% -> piso em 31.00 * (1 - 0.006) = 30.81
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+        highestPrice: 31.00,
+      };
+
+      const result = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 30.80, // Caiu abaixo de 30.81
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        breakevenTriggerPct: 0.008,
+        trailingStopPct: 0.006,
+      });
+
+      expect(result.action).toBe('SELL');
+      expect(result.quantity).toBe(2);
+      expect(result.amountBrl).toBe(61.60);
+      expect(result.rejectionReason).toContain('Automatic breakeven/trailing stop triggered');
+    });
+
+    it('contextualizes Breakeven and Trailing Stop status in buildB3Prompt when active', () => {
+      const prompt = buildB3Prompt(
+        {} as any,
+        { initialBankBrl: 100, cashBrl: 40 },
+        { ticker: 'PETR4', quantity: 2, entryPrice: 30.0, costBrl: 60, highestPrice: 30.30 }, // +1.0% de alta já alcançada
+        30.15,
+      );
+
+      expect(prompt).toContain('PROTEÇÃO DE BREAKEVEN ATIVA');
+      expect(prompt).toContain('máxima atingida R$ 30.30');
+      expect(prompt).toContain('preço de custo R$ 30.02');
+      expect(prompt).toContain('É expressamente proibido deixar a posição devolver ganhos');
     });
   });
 
@@ -365,6 +504,59 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
 
       expect(positiveCandles).toBeGreaterThan(10);
       expect(negativeCandles).toBeGreaterThan(10);
+    });
+  });
+
+  describe('BUG-07: Sincronização e Amostragem Temporal Coerente entre Candles (1m, 5m e 15m)', () => {
+    it('returns the exact same close price across 1m, 5m and 15m for the latest candle', async () => {
+      const marketData = new B3MarketDataService();
+      marketData.setMockPrice('VALE3', 60.0);
+
+      const [c1m, c5m, c15m] = await Promise.all([
+        marketData.candles('VALE3', '1m', 30),
+        marketData.candles('VALE3', '5m', 30),
+        marketData.candles('VALE3', '15m', 30),
+      ]);
+
+      const last1m = c1m[c1m.length - 1];
+      const last5m = c5m[c5m.length - 1];
+      const last15m = c15m[c15m.length - 1];
+
+      // O preço de fechamento mais recente deve ser idêntico em todos os tempos gráficos
+      expect(last1m.close).toBe(last5m.close);
+      expect(last1m.close).toBe(last15m.close);
+      expect(await marketData.price('VALE3')).toBe(last1m.close);
+    });
+
+    it('faithfully aggregates 5 consecutive 1m candles into 5m candles and 15 into 15m candles', async () => {
+      const marketData = new B3MarketDataService();
+      // Criamos 15 candles manuais de 1m para checagem exata da agregação OHLCV
+      const baseTime = 1700000000000;
+      const mock1m = [
+        { openTime: baseTime, open: 10.0, high: 10.5, low: 9.8, close: 10.2, volume: 100, closeTime: baseTime + 59999 },
+        { openTime: baseTime + 60000, open: 10.2, high: 11.0, low: 10.1, close: 10.8, volume: 150, closeTime: baseTime + 119999 },
+        { openTime: baseTime + 120000, open: 10.8, high: 10.9, low: 10.3, close: 10.5, volume: 200, closeTime: baseTime + 179999 },
+        { openTime: baseTime + 180000, open: 10.5, high: 10.7, low: 10.4, close: 10.6, volume: 120, closeTime: baseTime + 239999 },
+        { openTime: baseTime + 240000, open: 10.6, high: 11.2, low: 10.5, close: 11.1, volume: 180, closeTime: baseTime + 299999 },
+      ];
+
+      marketData.setMockCandles('TEST3', '1m', mock1m);
+
+      const c5m = await marketData.candles('TEST3', '5m', 10);
+      expect(c5m.length).toBe(1);
+      const agg5m = c5m[0];
+
+      // O candle agregado de 5m deve ter:
+      // open do primeiro candle (10.0)
+      expect(agg5m.open).toBe(10.0);
+      // close do último candle (11.1)
+      expect(agg5m.close).toBe(11.1);
+      // high máximo entre eles (11.2)
+      expect(agg5m.high).toBe(11.2);
+      // low mínimo entre eles (9.8)
+      expect(agg5m.low).toBe(9.8);
+      // soma dos volumes (100 + 150 + 200 + 120 + 180 = 750)
+      expect(agg5m.volume).toBe(750);
     });
   });
 });
