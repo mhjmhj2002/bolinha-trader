@@ -1,5 +1,6 @@
 import type { Action, SymbolRules } from '@bolinha/core';
 import { roundStepDown } from '@bolinha/core';
+import type { EntryConfluenceResult } from '@bolinha/market-data';
 export interface B3Account {
   initialBankBrl: number;
   cashBrl: number;
@@ -33,6 +34,15 @@ export interface B3RiskInput {
   breakevenTriggerPct?: number;
   /** Distância percentual do trailing stop a partir da máxima (ex: 0.006 para 0.6% abaixo do topo) quando o lucro superar o breakeven */
   trailingStopPct?: number;
+  /** Banda de ruído (ex: 0.004 = 0.4%): SELL discricionário da IA com |PnL| menor que isto vira HOLD (evita overtrading). */
+  sellNoiseBandPct?: number;
+  /**
+   * Confluência multi-timeframe (1m/5m/15m) já avaliada por @bolinha/market-data.
+   * Quando informada, um BUY só passa se a confluência for válida e atingir o mínimo configurado.
+   */
+  entryConfluence?: EntryConfluenceResult | null;
+  /** Exigir confluência multi-timeframe para BUY. Default true (fail-closed). */
+  requireEntryConfluence?: boolean;
 }
 
 export interface B3RiskResult {
@@ -121,6 +131,19 @@ export function applyB3Risk(input: B3RiskInput): B3RiskResult {
     if (action === 'BUY') return holdB3('BUY prohibited: day trade session is in close-only mode');
   }
 
+  // Filtro de entrada multi-timeframe: um BUY só passa quando a confluência já
+  // avaliada (EMA9 > EMA21 e RSI não sobrecomprado em 1m/5m/15m) é válida e
+  // atinge o mínimo configurado. Sem dados válidos => HOLD (fail-closed).
+  if (action === 'BUY' && (input.requireEntryConfluence === true || input.entryConfluence)) {
+    const confluence = input.entryConfluence;
+    if (!confluence || !confluence.valid || !confluence.allowed) {
+      const detail = confluence
+        ? confluence.reason
+        : 'multi-timeframe confluence data unavailable (fail-closed)';
+      return holdB3(`BUY rejected by multi-timeframe entry filter: ${detail}`);
+    }
+  }
+
   if (action === 'BUY') {
     if (!Number.isFinite(input.requestedBrl) || input.requestedBrl <= 0) {
       return holdB3('Invalid requested amount');
@@ -152,6 +175,12 @@ export function applyB3Risk(input: B3RiskInput): B3RiskResult {
   }
 
   if (!position) return holdB3('SELL prohibited: no open B3 position');
+  if (!input.isDayTradeCloseOnly && typeof input.sellNoiseBandPct === 'number' && input.sellNoiseBandPct > 0) {
+    const pnlPct = (price - position.entryPrice) / position.entryPrice;
+    if (Math.abs(pnlPct) < input.sellNoiseBandPct) {
+      return holdB3(`SELL rejected: PnL ${(pnlPct * 100).toFixed(2)}% is within noise band ±${(input.sellNoiseBandPct * 100).toFixed(2)}%`);
+    }
+  }
   // SELL parcial: valor pedido convertido em ações (1..posição); valor inválido ou >= posição encerra tudo.
   const requestedQty = Number.isFinite(input.requestedBrl) && input.requestedBrl > 0
     ? Math.ceil(input.requestedBrl / price)

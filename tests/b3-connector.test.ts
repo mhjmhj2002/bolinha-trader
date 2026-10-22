@@ -10,7 +10,8 @@ import {
 } from '@bolinha/exchange';
 import { applyB3Risk } from '@bolinha/risk-engine';
 import { buildB3Prompt } from '@bolinha/ai';
-import { calculateIndicators } from '@bolinha/market-data';
+import { calculateIndicators, type Candle } from '@bolinha/market-data';
+import { config } from '@bolinha/core';
 
 describe('B3 Stock Day Trade & Connector Suite', () => {
   describe('B3 Tickers and Rules', () => {
@@ -557,6 +558,400 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       expect(agg5m.low).toBe(9.8);
       // soma dos volumes (100 + 150 + 200 + 120 + 180 = 750)
       expect(agg5m.volume).toBe(750);
+    });
+  });
+
+  describe('BUG-08: Progressão Temporal Dinâmica e Janela Deslizante de Candles Sintéticos', () => {
+    it('appends new 1m candles sequentially when time elapses and retains continuity', async () => {
+      const marketData = new B3MarketDataService();
+      marketData.setMockPrice('PETR4', 30.0);
+
+      // Chamada inicial: gera série de 1m terminando no tempo T0
+      const initial1m = await marketData.candles('PETR4', '1m', 10);
+      expect(initial1m.length).toBe(10);
+      const firstLast = initial1m[initial1m.length - 1];
+
+      // Simula passagem de tempo de 3 minutos (180_000 ms) avançando Date.now
+      const futureNow = firstLast.closeTime + 180_000 + 1000;
+      const originalNow = Date.now;
+      try {
+        Date.now = () => futureNow;
+
+        const updated1m = await marketData.candles('PETR4', '1m', 10);
+        expect(updated1m.length).toBe(10);
+        const secondLast = updated1m[updated1m.length - 1];
+
+        // O último candle agora deve ter closeTime mais recente correspondente ao futureNow
+        expect(secondLast.closeTime).toBeGreaterThan(firstLast.closeTime);
+
+        // Preço deve ter se atualizado dinamicamente
+        const currentPrice = await marketData.price('PETR4');
+        expect(currentPrice).toBe(secondLast.close);
+
+        // Candles de 5m e 15m também refletem o novo fechamento
+        const c5m = await marketData.candles('PETR4', '5m', 10);
+        expect(c5m[c5m.length - 1].close).toBe(secondLast.close);
+      } finally {
+        Date.now = originalNow;
+      }
+    });
+
+    it('limits sliding window size to prevent memory leaks', async () => {
+      const marketData = new B3MarketDataService();
+      await marketData.candles('VALE3', '1m', 100);
+
+      const originalNow = Date.now;
+      try {
+        // Simular um salto grande no tempo (ex: 5000 minutos transcorridos)
+        const hugeFuture = originalNow() + 5000 * 60_000;
+        Date.now = () => hugeFuture;
+
+        const candles = await marketData.candles('VALE3', '1m', 100);
+        expect(candles.length).toBe(100);
+
+        // Internamente não deve crescer indefinidamente
+        const allStored = (marketData as any).candlesStore.get('VALE3')?.['1m'];
+        expect(allStored).toBeDefined();
+        expect(allStored.length).toBeLessThanOrEqual(4000);
+      } finally {
+        Date.now = originalNow;
+      }
+    });
+  });
+
+  describe('Melhoria #4: Modelo Sintético de Ondas de Momentum Intradiárias', () => {
+    /** Longest stretch of consecutive same-direction closes (flat candles break the run). */
+    const longestDirectionalRun = (candles: Candle[]): number => {
+      let best = 0;
+      let current = 0;
+      let direction = 0;
+      for (let index = 1; index < candles.length; index++) {
+        const delta = Math.sign(Number((candles[index].close - candles[index - 1].close).toFixed(2)));
+        if (delta === 0) {
+          current = 0;
+          direction = 0;
+          continue;
+        }
+        if (delta === direction) current += 1;
+        else {
+          direction = delta;
+          current = 1;
+        }
+        if (current > best) best = current;
+      }
+      return best;
+    };
+
+    /** Collects the whole simulated session minute by minute, pinning the clock for determinism. */
+    const walkSession = async (
+      marketData: B3MarketDataService,
+      minutes: number,
+      startTime = 1_700_000_000_000,
+    ): Promise<Candle[]> => {
+      const originalNow = Date.now;
+      try {
+        let clock = startTime;
+        Date.now = () => clock;
+        const initial = await marketData.candles('PETR4', '1m', 100);
+        const collected: Candle[] = [...initial];
+        for (let minute = 0; minute < minutes; minute++) {
+          clock += 60_000;
+          const at = clock;
+          Date.now = () => at;
+          const next = await marketData.candles('PETR4', '1m', 100);
+          collected.push(next[next.length - 1]);
+        }
+        return collected;
+      } finally {
+        Date.now = originalNow;
+      }
+    };
+
+    it('extends trends for several consecutive candles instead of a flat mean-reverting walk', async () => {
+      const momentumRuns: number[] = [];
+      const noiseRuns: number[] = [];
+      for (const seed of [1, 2, 3, 5, 7, 11, 42, 99]) {
+        const trending = new B3MarketDataService({ seed });
+        trending.setMockPrice('PETR4', 30);
+        momentumRuns.push(longestDirectionalRun(await walkSession(trending, 120)));
+
+        // Same model with the drift switched off is the old pure-noise baseline.
+        const noise = new B3MarketDataService({ seed, momentumDrift: 0, trendSegmentCandles: 1 });
+        noise.setMockPrice('PETR4', 30);
+        noiseRuns.push(longestDirectionalRun(await walkSession(noise, 120)));
+      }
+
+      // Momentum persistence: every seed shows a genuine multi-candle wave.
+      expect(Math.min(...momentumRuns)).toBeGreaterThanOrEqual(6);
+      // ...and the trends extend meaningfully longer than the drift-free baseline.
+      const averaged = (values: number[]) => values.reduce((total, value) => total + value, 0) / values.length;
+      expect(averaged(momentumRuns)).toBeGreaterThan(averaged(noiseRuns) + 1);
+    });
+
+    it('lets price progress away from the anchor while staying inside plausible bounds', async () => {
+      const anchor = 30;
+      const boundPct = config.SYNTHETIC_PRICE_BOUND_PCT;
+      for (const seed of [1, 3, 7, 42]) {
+        const marketData = new B3MarketDataService({ seed });
+        marketData.setMockPrice('PETR4', anchor);
+        const session = await walkSession(marketData, 120, 1_700_100_000_000);
+
+        const deviationPct = Math.max(...session.map((candle) => Math.abs(candle.close - anchor))) / anchor;
+        // Meaningful progress away from the base price (no more R$29.50-29.80 oscillation).
+        expect(deviationPct).toBeGreaterThan(0.005);
+        // Bounded: never runs away past the configured plausibility band.
+        expect(deviationPct).toBeLessThanOrEqual(boundPct + 0.0001);
+        for (const candle of session) {
+          expect(candle.close).toBeGreaterThan(0);
+          expect(candle.low).toBeGreaterThan(0);
+          expect(candle.open).toBeGreaterThanOrEqual(Number((anchor * (1 - boundPct)).toFixed(2)) - 0.01);
+          expect(candle.close).toBeLessThanOrEqual(Number((anchor * (1 + boundPct)).toFixed(2)));
+        }
+      }
+    });
+
+    it('keeps OHLC invariants, positive volume and monotonic timestamps across timeframes', async () => {
+      const marketData = new B3MarketDataService({ seed: 2024 });
+      marketData.setMockPrice('PETR4', 30);
+      const series = {
+        '1m': await marketData.candles('PETR4', '1m', 100),
+        '5m': await marketData.candles('PETR4', '5m', 100),
+        '15m': await marketData.candles('PETR4', '15m', 100),
+      };
+
+      for (const candles of Object.values(series)) {
+        for (let index = 1; index < candles.length; index++) {
+          const previous = candles[index - 1];
+          const current = candles[index];
+          expect(current.openTime).toBeGreaterThan(previous.openTime);
+          expect(current.closeTime).toBeGreaterThan(current.openTime);
+          expect(current.high).toBeGreaterThanOrEqual(Math.max(current.open, current.close));
+          expect(current.low).toBeLessThanOrEqual(Math.min(current.open, current.close));
+          expect(current.low).toBeGreaterThan(0);
+          expect(current.volume).toBeGreaterThan(0);
+        }
+      }
+
+      // The newest close stays shared by every timeframe (BUG-07 contract).
+      const last = (candles: Candle[]) => candles[candles.length - 1].close;
+      expect(last(series['5m'])).toBe(last(series['1m']));
+      expect(last(series['15m'])).toBe(last(series['1m']));
+    });
+
+    it('is deterministic under a fixed seed and diverges with a different seed', async () => {
+      const originalNow = Date.now;
+      const pinned = 1_700_200_000_000;
+      try {
+        Date.now = () => pinned;
+        const first = new B3MarketDataService({ seed: 424242 });
+        const repeated = new B3MarketDataService({ seed: 424242 });
+        const different = new B3MarketDataService({ seed: 424243 });
+        for (const service of [first, repeated, different]) service.setMockPrice('PETR4', 30);
+
+        const firstSeries = await first.candles('PETR4', '1m', 80);
+        const repeatedSeries = await repeated.candles('PETR4', '1m', 80);
+        const differentSeries = await different.candles('PETR4', '1m', 80);
+
+        expect(repeatedSeries).toEqual(firstSeries);
+        expect(differentSeries.some((candle, index) => candle.close !== firstSeries[index].close)).toBe(true);
+      } finally {
+        Date.now = originalNow;
+      }
+    });
+
+    it('gives each ticker its own path from the same seed', async () => {
+      const originalNow = Date.now;
+      try {
+        Date.now = () => 1_700_300_000_000;
+        const marketData = new B3MarketDataService({ seed: 7 });
+        marketData.setMockPrice('PETR4', 30);
+        marketData.setMockPrice('VALE3', 30);
+        const petro = await marketData.candles('PETR4', '1m', 60);
+        const vale = await marketData.candles('VALE3', '1m', 60);
+        expect(vale.some((candle, index) => candle.close !== petro[index].close)).toBe(true);
+      } finally {
+        Date.now = originalNow;
+      }
+    });
+  });
+
+  describe('BUG-10 chunk B: Agregação Estável e Completa de Candles 5m e 15m', () => {
+    const FIVE_MIN_MS = 5 * 60_000;
+    const FIFTEEN_MIN_MS = 15 * 60_000;
+
+    /**
+     * Fixture 1m contígua alinhada à grade de 5m (início múltiplo de 300_000 ms), com
+     * volumes e fechamentos DISTINTOS: um bucket parcial é inconfundível, e o fechamento
+     * agregado revela exatamente qual candle de 1m fechou o bucket.
+     */
+    const buildAligned1m = (count: number, start = 1_700_000_400_000): Candle[] =>
+      Array.from({ length: count }, (_, index) => {
+        const openTime = start + index * 60_000;
+        const open = Number((10 + index * 0.1).toFixed(2));
+        const close = Number((open + 0.05).toFixed(2));
+        return {
+          openTime,
+          open,
+          high: Number((close + 0.2).toFixed(2)),
+          low: Number((open - 0.2).toFixed(2)),
+          close,
+          volume: index + 1,
+          closeTime: openTime + 59_999,
+        };
+      });
+
+    it('never emits a short trailing 5m bucket when 13 one-minute candles are fed', async () => {
+      const marketData = new B3MarketDataService();
+      const candles1m = buildAligned1m(13); // volumes 1..13, fechamentos todos distintos
+      marketData.setMockCandles('AGG13', '1m', candles1m);
+
+      const c5m = await marketData.candles('AGG13', '5m', 50);
+
+      // floor(13 / 5) === 2: os 3 candles que sobram no fim NÃO viram um candle "curto".
+      expect(c5m).toHaveLength(Math.floor(13 / 5));
+
+      // Nenhum volume artificialmente baixo: o menor volume possível de um bucket completo
+      // desta fixture é 1+2+3+4+5 = 15. Um bucket parcial de 3 candles daria no máximo 12.
+      for (const bucket of c5m) expect(bucket.volume).toBeGreaterThanOrEqual(15);
+
+      // O histórico fica ancorado no relógio ([0..4]) e o bucket do topo é a janela rolante
+      // dos 5 últimos candles de 1m ([8..12]), que é o que mantém o fechamento mais novo igual.
+      const volumeOf = (from: number, factor = 5) =>
+        candles1m.slice(from, from + factor).reduce((total, candle) => total + candle.volume, 0);
+      expect(c5m.map((bucket) => bucket.volume)).toEqual([volumeOf(0), volumeOf(8)]);
+      expect(c5m[0].volume).toBe(15); // 1+2+3+4+5
+      expect(c5m[1].volume).toBe(55); // 9+10+11+12+13
+
+      // Cada `close` agregado é o `close` do ÚLTIMO candle de 1m do bucket (nunca uma média,
+      // nunca o fechamento do candle em formação fora do bucket).
+      expect(c5m[0].close).toBe(candles1m[4].close);
+      expect(c5m[1].close).toBe(candles1m[12].close);
+
+      // E o fechamento mais novo continua idêntico ao candle de 1m mais novo (contrato BUG-07).
+      expect(c5m[c5m.length - 1].close).toBe(candles1m[candles1m.length - 1].close);
+    });
+
+    it('aggregates open/high/low/close/volume of an explicit 5-candle window exactly', async () => {
+      const marketData = new B3MarketDataService();
+      const baseTime = 1_700_000_400_000; // múltiplo de 300_000 => bucket alinhado
+      // Volumes uniformes (100): o agregado tem de ser exatamente 500 = 5 × 100, o que só é
+      // verdade se o bucket tiver EXATAMENTE 5 candles (nunca 3 ou 4).
+      const mock1m: Candle[] = [
+        [10.0, 10.5, 10.05, 10.2],
+        [10.2, 11.0, 10.1, 10.8],
+        [10.8, 10.9, 10.3, 10.5],
+        [10.5, 10.7, 9.95, 10.6],
+        [10.6, 11.2, 10.4, 11.1],
+      ].map(([open, high, low, close], index) => {
+        const openTime = baseTime + index * 60_000;
+        return { openTime, open, high, low, close, volume: 100, closeTime: openTime + 59_999 };
+      });
+      marketData.setMockCandles('AGGOHLC', '1m', mock1m);
+
+      const c5m = await marketData.candles('AGGOHLC', '5m', 10);
+
+      expect(c5m).toHaveLength(1);
+      expect(c5m[0]).toEqual({
+        openTime: baseTime, // abertura do primeiro candle do bucket
+        open: 10.0, // open do primeiro candle de 1m
+        high: 11.2, // máximo dos highs
+        low: 9.95, // mínimo dos lows
+        close: 11.1, // close do último candle de 1m
+        volume: 500, // soma exata dos 5 volumes
+        closeTime: baseTime + 299_999, // openTime + intervalMs - 1
+      });
+    });
+
+    it('keeps bucket open times and OHLCV stable while the 1m window slides', async () => {
+      const marketData = new B3MarketDataService({ seed: 31415 });
+      marketData.setMockPrice('PETR4', 30);
+      const originalNow = Date.now;
+      // Relógio desalinhado da grade de 5m de propósito (resto 200_000), como no runtime real.
+      let clock = 1_700_000_000_000;
+      try {
+        Date.now = () => clock;
+        const snapshots: Candle[][] = [];
+        for (let cycle = 0; cycle < 4; cycle++) {
+          const buckets = await marketData.candles('PETR4', '5m', 100);
+          const newest1m = await marketData.candles('PETR4', '1m', 100);
+          snapshots.push(buckets);
+          // Contrato BUG-07 mantido em todos os ciclos, inclusive nos desalinhados.
+          expect(buckets[buckets.length - 1].close).toBe(newest1m[newest1m.length - 1].close);
+          // A sessão avança 2 minutos: a série de 1m cresce e a janela desliza.
+          clock += 120_000;
+          Date.now = () => clock;
+        }
+
+        // Um bucket do MEIO do histórico inicial é a testemunha do "sem deslocamento": ele tem de
+        // sobreviver a todos os ciclos seguintes com exatamente o mesmo OHLCV.
+        const witness = snapshots[0][Math.floor(snapshots[0].length / 2)];
+        for (let cycle = 1; cycle < snapshots.length; cycle++) {
+          const previous = new Map(snapshots[cycle - 1].map((candle) => [candle.openTime, candle]));
+          const shared = snapshots[cycle].filter((candle) => previous.has(candle.openTime));
+          const next = new Map(snapshots[cycle].map((candle) => [candle.openTime, candle]));
+
+          // Só o candle do topo (janela rolante) e a borda truncada da janela de 1m podem diferir:
+          // todo o resto das fronteiras é reaproveitado byte a byte.
+          expect(shared.length).toBeGreaterThanOrEqual(snapshots[cycle].length - 2);
+          for (const bucket of shared) expect(bucket).toEqual(previous.get(bucket.openTime));
+
+          const witnessInCycle = next.get(witness.openTime);
+          expect(witnessInCycle).toEqual(witness);
+        }
+
+        // Histórico fechado fica na grade do relógio: apenas o candle rolante do topo acompanha o
+        // candle de 1m em formação (fora da grade, quando a fita não está alinhada).
+        for (const buckets of snapshots) {
+          for (let index = 0; index < buckets.length; index++) {
+            expect(buckets[index].closeTime).toBe(buckets[index].openTime + 300_000 - 1);
+            if (index < buckets.length - 1) expect(buckets[index].openTime % 300_000).toBe(0);
+          }
+        }
+      } finally {
+        Date.now = originalNow;
+      }
+    });
+
+    it('aligns every closed bucket to the interval grid and closes one interval later', async () => {
+      const cases = [
+        { interval: '5m' as const, factor: 5, count: 20, start: 1_700_000_400_000, intervalMs: FIVE_MIN_MS },
+        {
+          interval: '15m' as const,
+          factor: 15,
+          count: 30,
+          start: 1_700_000_100_000,
+          intervalMs: FIFTEEN_MIN_MS,
+        },
+      ];
+
+      for (const { interval, factor, count, start, intervalMs } of cases) {
+        const candles1m = buildAligned1m(count, start);
+        const marketData = new B3MarketDataService();
+        marketData.setMockCandles('GRID3', '1m', candles1m);
+
+        const aggregated = await marketData.candles('GRID3', interval, 50);
+
+        // A série termina num bucket completo: nada é descartado nem rolado.
+        expect(aggregated).toHaveLength(count / factor);
+
+        for (const bucket of aggregated) {
+          // Alinhamento à grade do intervalo (5m/15m) e fechamento de exatamente uma janela.
+          expect(bucket.openTime % intervalMs).toBe(0);
+          expect(bucket.closeTime).toBe(bucket.openTime + intervalMs - 1);
+
+          const window = candles1m.filter((candle) => candle.openTime >= bucket.openTime).slice(0, factor);
+          expect(window).toHaveLength(factor);
+          expect(bucket.open).toBe(window[0].open);
+          expect(bucket.close).toBe(window[window.length - 1].close);
+          expect(bucket.high).toBe(Math.max(...window.map((candle) => candle.high)));
+          expect(bucket.low).toBe(Math.min(...window.map((candle) => candle.low)));
+          expect(bucket.volume).toBe(window.reduce((total, candle) => total + candle.volume, 0));
+        }
+
+        for (let index = 1; index < aggregated.length; index++) {
+          expect(aggregated[index].openTime).toBeGreaterThan(aggregated[index - 1].openTime);
+        }
+      }
     });
   });
 });

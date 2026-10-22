@@ -935,7 +935,7 @@ export class TradingRepository {
     // Preserve the query shape of the dashboard read model; the effective
     // schedule is resolved from the session snapshot after these reads.
     const localDay = [day, defaultTradingConfiguration.timezone];
-    const [accountResult, sessionResult, dailyResult, snapshotsResult, tradesResult, decisionsResult, usageResult, eventsResult] = await Promise.all([
+    const [accountResult, sessionResult, dailyResult, snapshotsResult, tradesResult, decisionsResult, usageResult, eventsResult, decisionCountsResult, openPositionResult] = await Promise.all([
       this.client.query<Row>('select initial_bank_usdt,cash_usdt,realized_pnl_usdt,ai_cost_usd from trading_account order by id limit 1'),
       this.client.query<Row>('select * from trading_sessions where session_day=$1', [day]),
       this.client.query<Row>('select * from daily_results where session_day=$1', [day]),
@@ -959,6 +959,18 @@ export class TradingRepository {
       this.client.query<Row>(
         `select level,event,message,created_at from system_events
          where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at desc limit 100`, localDay),
+      this.client.query<Row>(
+        `select
+           action_after_risk,
+           count(*)::int as count,
+           count(*) filter (where action_requested <> action_after_risk)::int as rejected_by_risk
+         from ai_decisions
+         where to_char(timestamp at time zone $2, 'YYYY-MM-DD') = $1
+         group by action_after_risk`, localDay),
+      // Transactional truth for the current day: the panel must never show a
+      // phantom position after a sale/force close that happened after the last
+      // account snapshot (BUG-10 parte C).
+      this.client.query<Row>("select quantity,entry_price,cost_usdt from positions where status='OPEN' order by id desc limit 1"),
     ]);
     const account = accountResult.rows[0];
     const session = sessionResult.rows[0] ?? null;
@@ -983,45 +995,82 @@ export class TradingRepository {
       reason: row.reason, rejectionReason: row.rejection_reason,
     }));
     const decisionCounts = { BUY: 0, SELL: 0, HOLD: 0, rejectedByRisk: 0 };
-    for (const decision of decisions) {
-      const action = String(decision.actionAfterRisk) as 'BUY' | 'SELL' | 'HOLD';
-      if (action in decisionCounts) decisionCounts[action]++;
-      if (decision.actionRequested !== decision.actionAfterRisk) decisionCounts.rejectedByRisk++;
+    for (const row of decisionCountsResult.rows) {
+      const action = String(row.action_after_risk) as 'BUY' | 'SELL' | 'HOLD';
+      if (action in decisionCounts) decisionCounts[action] += num(row.count);
+      decisionCounts.rejectedByRisk += num(row.rejected_by_risk);
     }
     const models = usageResult.rows.map((row) => ({ model: String(row.model), calls: num(row.calls), promptTokens: num(row.prompt_tokens), completionTokens: num(row.completion_tokens), totalTokens: num(row.total_tokens), costUsd: num(row.cost_usd) }));
     const fallbackCount = eventsResult.rows.filter((row) => String(row.event) === 'ai_fallback').length;
     const errorCount = eventsResult.rows.filter((row) => String(row.level) === 'ERROR').length;
     const liveToday = day === sessionDay();
-    const finalEquity = liveToday && latest
-      ? latest.equityUsdt
+    // BUG-10 parte C: for the current day the transactional ledger
+    // (trading_account + positions WHERE status='OPEN') is the source of truth;
+    // account_snapshots only feeds the historical chart and is a fallback when
+    // the ledger row is missing.  A sale/force close must never leave a phantom
+    // position behind the last snapshot of the day.
+    const livePosition = openPositionResult.rows[0] ?? null;
+    // The last snapshot price is the only market price this read model owns; it
+    // is used to value an open position, never to age a position that no longer
+    // exists.
+    const livePrice = latest?.price ?? null;
+    const openQuantity = livePosition ? num(livePosition.quantity) : 0;
+    const openCostUsdt = livePosition ? num(livePosition.cost_usdt) : 0;
+    const positionOpen = liveToday ? livePosition !== null : Boolean(latest?.positionQuantity);
+    // Mirrors performance(price): equity = cash + market value of the open
+    // position. Unknown price with an open position => null, never a
+    // plausible-looking valuation.
+    const liveMarketValue = positionOpen && livePrice !== null ? openQuantity * livePrice : null;
+    const cashUsdt = liveToday
+      ? account ? num(account.cash_usdt) : latest?.cashUsdt ?? null
+      : latest?.cashUsdt ?? null;
+    const positionQuantity = liveToday ? (positionOpen ? openQuantity : null) : latest?.positionQuantity ?? null;
+    const positionCostUsdt = liveToday
+      ? positionOpen ? openCostUsdt : 0
+      : latest?.positionQuantity && latest?.positionCostUsdt ? latest.positionCostUsdt : 0;
+    const positionPrice = liveToday ? livePrice : latest?.price ?? null;
+    const positionMarketValueUsdt = liveToday
+      ? positionOpen ? (liveMarketValue === null ? null : Number(liveMarketValue.toFixed(2))) : 0
+      : latest?.positionQuantity && latest?.price ? Number((latest.positionQuantity * latest.price).toFixed(2)) : 0;
+    const finalEquity = liveToday
+      ? cashUsdt === null || (positionOpen && liveMarketValue === null) ? null : cashUsdt + (liveMarketValue ?? 0)
       : daily?.final_equity_usdt === null || daily?.final_equity_usdt === undefined
         ? latest?.equityUsdt ?? null
         : num(daily.final_equity_usdt);
     const dailyTradesRealizedPnl = tradesResult.rows
       .filter((row) => row.side === 'SELL')
       .reduce((sum, row) => sum + num(row.net_pnl_usdt), 0);
+    // Realized P/L is day-scoped: the consolidated result when it exists,
+    // otherwise the SELL trades of that day. `trading_account.realized_pnl_usdt`
+    // is cumulative across sessions and would leak previous days into today.
     const realizedPnlUsdt = daily?.realized_pnl_usdt !== null && daily?.realized_pnl_usdt !== undefined
       ? num(daily.realized_pnl_usdt)
       : dailyTradesRealizedPnl;
-    const unrealizedPnlUsdt = latest && latest.positionQuantity && latest.positionCostUsdt
-      ? latest.positionQuantity * latest.price - latest.positionCostUsdt
-      : (daily?.unrealized_pnl_usdt !== null && daily?.unrealized_pnl_usdt !== undefined ? num(daily.unrealized_pnl_usdt) : 0);
-    const netPnlUsdt = daily?.net_pnl_usdt !== null && daily?.net_pnl_usdt !== undefined
-      ? num(daily.net_pnl_usdt)
-      : (initialBankUsdt !== null && finalEquity !== null ? finalEquity - initialBankUsdt : realizedPnlUsdt + unrealizedPnlUsdt);
+    const unrealizedPnlUsdt = liveToday
+      ? !positionOpen ? 0 : liveMarketValue === null ? null : liveMarketValue - openCostUsdt
+      : latest && latest.positionQuantity && latest.positionCostUsdt
+        ? latest.positionQuantity * latest.price - latest.positionCostUsdt
+        : (daily?.unrealized_pnl_usdt !== null && daily?.unrealized_pnl_usdt !== undefined ? num(daily.unrealized_pnl_usdt) : 0);
+    const netPnlUsdt = liveToday
+      ? realizedPnlUsdt === null || unrealizedPnlUsdt === null ? null : realizedPnlUsdt + unrealizedPnlUsdt
+      : daily?.net_pnl_usdt !== null && daily?.net_pnl_usdt !== undefined
+        ? num(daily.net_pnl_usdt)
+        : (initialBankUsdt !== null && finalEquity !== null ? finalEquity - initialBankUsdt : (realizedPnlUsdt ?? 0) + (unrealizedPnlUsdt ?? 0));
     return {
       schedule: { timezone: schedule.timezone, startTime: schedule.start, stopNewPositionsTime: schedule.stopNewPositions, forceCloseTime: schedule.forceClose, endTime: schedule.end, intervalSeconds: schedule.intervalSeconds },
       session: session && { day, phase: String(session.phase), timezone: String(session.timezone), startedAt: session.started_at ? new Date(String(session.started_at)).toISOString() : null, finishedAt: session.finished_at ? new Date(String(session.finished_at)).toISOString() : null, lastCycleAt: session.last_cycle_at ? new Date(String(session.last_cycle_at)).toISOString() : null, nextCycleAt: session.next_cycle_at ? new Date(String(session.next_cycle_at)).toISOString() : null, cyclesToday: num(session.cycles_today) },
       account: {
         initialBankUsdt,
-        cashUsdt: latest?.cashUsdt ?? (day === sessionDay() && account ? num(account.cash_usdt) : null),
+        cashUsdt,
         equityUsdt: finalEquity,
-        positionCostUsdt: latest?.positionQuantity && latest?.positionCostUsdt ? latest.positionCostUsdt : 0,
-        positionMarketValueUsdt: latest?.positionQuantity && latest?.price ? Number((latest.positionQuantity * latest.price).toFixed(2)) : 0,
+        positionCostUsdt,
+        positionMarketValueUsdt,
         aiCostUsd: daily?.ai_cost_usd === null || daily?.ai_cost_usd === undefined ? models.reduce((total, model) => total + model.costUsd, 0) : num(daily.ai_cost_usd),
       },
       performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt, returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
-      position: latest?.positionQuantity ? { symbol: config.SYMBOL, quantity: latest.positionQuantity, costUsdt: latest.positionCostUsdt, price: latest.price } : null,
+      position: positionOpen
+        ? { symbol: config.SYMBOL, quantity: positionQuantity, costUsdt: positionCostUsdt, price: positionPrice }
+        : null,
       decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), brokerOrderId: row.broker_order_id })),
       aiUsage: { models, fallbacks: fallbackCount, totalTokens: models.reduce((total, model) => total + model.totalTokens, 0), totalCostUsd: models.reduce((total, model) => total + model.costUsd, 0) },
       events: eventsResult.rows.map((row) => ({ level: row.level, event: row.event, message: row.message, at: new Date(String(row.created_at)).toISOString() })),

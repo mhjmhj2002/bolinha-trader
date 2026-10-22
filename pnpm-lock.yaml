@@ -248,6 +248,9 @@ importers:
       '@bolinha/core':
         specifier: workspace:*
         version: link:../core
+      '@bolinha/market-data':
+        specifier: workspace:*
+        version: link:../market-data
 
 packages:
 

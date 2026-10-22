@@ -33,7 +33,16 @@ export async function finishDailyIfPositionClosed(
   await emit('INFO', 'daily_result_pending', 'Daily result consolidation pending');
   try {
     const result = await repo.createDailyResult(await exchange.price(), at);
-    if (result) await emit('INFO', 'daily_result_created', 'Daily result persisted', { sessionDay: result.session_day });
+    // A null result means the consolidation transaction did not leave a
+    // readable daily_result behind. Returning success here used to strand the
+    // session in `PENDING` forever because no retry would ever be scheduled
+    // (BUG-10 parte C). Fail closed instead so the worker retries.
+    if (!result) throw new Error('Daily result consolidation produced no persisted daily_result row');
+    // The repository already flips the session to OK inside the same flow; the
+    // explicit call makes the pending marker impossible to survive here, even
+    // for reduced repositories.
+    await repo.markDailyResultOk?.(at);
+    await emit('INFO', 'daily_result_created', 'Daily result persisted', { sessionDay: result.session_day });
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown daily result failure';

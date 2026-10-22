@@ -1,4 +1,4 @@
-/* global Chart, document, window */
+/* global Chart, document, module, window */
 (() => {
   const charts = {};
   let data = null;
@@ -8,6 +8,44 @@
   const number = (value, digits = 2) => value === null || value === undefined ? '—' : Number(value).toLocaleString('pt-BR', { minimumFractionDigits: digits, maximumFractionDigits: digits });
   const money = (value, currency = 'R$', digits = 2) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '' : '-'}${currency === 'US$' ? 'US$ ' : currency === 'R$' ? 'R$ ' : ''}${number(Math.abs(value), digits)}${currency === 'USDT' ? ' USDT' : ''}`;
   const signedMoney = (value) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '+' : '-'}${number(Math.abs(value))} R$`;
+  const signedPercent = (value) => value === null || value === undefined ? '—' : `${Number(value) >= 0 ? '+' : ''}${number(value)}%`;
+  // BUG-10 parte B: profit with an open position is UNREALIZED (floating), an
+  // accounting wording/communication problem — never a calculation problem.
+  // The helpers below are pure (no DOM) so they can be asserted directly under
+  // Vitest, which has no jsdom environment in this repo.
+  const RESULT_LABEL = 'Resultado (inclui não realizado)';
+  const UNREALIZED_BADGE_TEXT = 'posição aberta — lucro não realizado';
+  const TRADE_PNL_PENDING_TEXT = 'P/L só é apurado na venda';
+  const pnlBreakdown = (performance = {}) => `Realizado: ${signedMoney(performance.realizedPnlUsdt)} · Em aberto: ${signedMoney(performance.unrealizedPnlUsdt)}`;
+  const unrealizedBadge = (position, realizedPnlUsdt) => position && realizedPnlUsdt === 0 ? UNREALIZED_BADGE_TEXT : '';
+  const positionMarketValue = (position) => position && position.quantity !== null && position.quantity !== undefined && position.price !== null && position.price !== undefined ? position.quantity * position.price : null;
+  const openPnl = (position) => {
+    const marketValue = positionMarketValue(position);
+    const cost = position && position.costUsdt !== null && position.costUsdt !== undefined ? position.costUsdt : null;
+    const pnlUsdt = marketValue === null || cost === null ? null : marketValue - cost;
+    return { pnlUsdt, pct: pnlUsdt === null || !cost ? null : (pnlUsdt / cost) * 100 };
+  };
+  const positionDetail = (position) => {
+    if (!position) return '—';
+    const { pnlUsdt, pct } = openPnl(position);
+    const average = position.quantity ? money(position.costUsdt / position.quantity) : '—';
+    return `Custo: ${money(position.costUsdt)} (Médio: ${average}) · P/L aberto: ${signedMoney(pnlUsdt)} (${signedPercent(pct)}) · Atual: ${money(position.price)}`;
+  };
+  const cashDetail = (cashUsdt, price) => {
+    if (!(price > 0) || cashUsdt === null || cashUsdt === undefined) return 'Disponível para compras';
+    const canBuy = Math.floor(cashUsdt / price);
+    return canBuy > 0 ? `Comportamento: até ${canBuy} ação(ões)` : `Caixa insuficiente para nova compra (mín. 1 ação = ${money(price)})`;
+  };
+  const tradePnl = (trade) => trade.netPnlUsdt === null || trade.netPnlUsdt === undefined
+    ? { text: '—', title: TRADE_PNL_PENDING_TEXT, tone: '' }
+    : { text: signedMoney(trade.netPnlUsdt), title: '', tone: Number(trade.netPnlUsdt) < 0 ? 'text-danger' : Number(trade.netPnlUsdt) > 0 ? 'text-success' : '' };
+  const DashboardPnl = { RESULT_LABEL, UNREALIZED_BADGE_TEXT, TRADE_PNL_PENDING_TEXT, number, money, signedMoney, signedPercent, pnlBreakdown, unrealizedBadge, positionMarketValue, openPnl, positionDetail, cashDetail, tradePnl };
+  // Works both as a browser script (window.DashboardPnl) and as a CommonJS
+  // module imported by tests. In Node there is no document, so the DOM wiring
+  // below is skipped and only the pure helpers are exported.
+  globalThis.DashboardPnl = DashboardPnl;
+  if (typeof module !== 'undefined' && module.exports) module.exports = DashboardPnl;
+  if (typeof document === 'undefined') return;
   const time = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(iso)) : '—';
   const dateTime = (iso) => iso ? new Intl.DateTimeFormat('pt-BR', { timeZone: timezone(), dateStyle: 'short', timeStyle: 'short' }).format(new Date(iso)) : '—';
   const escape = (value) => String(value ?? '—').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
@@ -44,21 +82,20 @@
     $('metric-cash').textContent = money(account.cashUsdt);
     if ($('metric-cash-detail')) {
       const price = position?.price ?? (payload.position?.price ?? null);
-      if (price && price > 0 && account.cashUsdt !== null) {
-        const canBuy = Math.floor(account.cashUsdt / price);
-        $('metric-cash-detail').textContent = `Comportamento: até ${canBuy} ação(ões)`;
-      } else {
-        $('metric-cash-detail').textContent = 'Disponível para compras';
-      }
+      $('metric-cash-detail').textContent = cashDetail(account.cashUsdt, price);
     }
 
     $('metric-pnl').textContent = signedMoney(performance.netPnlUsdt);
     $('metric-pnl').className = `metric-value ${Number(performance.netPnlUsdt) < 0 ? 'text-danger' : Number(performance.netPnlUsdt) > 0 ? 'text-success' : ''}`;
-    $('metric-pnl-breakdown').textContent = `Real: ${signedMoney(performance.realizedPnlUsdt)} · Flut: ${signedMoney(performance.unrealizedPnlUsdt)}`;
-    $('metric-return').textContent = performance.returnPct === null ? '—' : `${Number(performance.returnPct) >= 0 ? '+' : ''}${number(performance.returnPct)}%`;
+    $('metric-pnl-label').textContent = RESULT_LABEL;
+    $('metric-pnl-breakdown').textContent = pnlBreakdown(performance);
+    $('metric-return').textContent = signedPercent(performance.returnPct);
+    const badgeText = unrealizedBadge(position, performance.realizedPnlUsdt);
+    $('metric-pnl-badge').textContent = badgeText;
+    $('metric-pnl-badge').className = `badge text-bg-warning mt-1${badgeText ? '' : ' d-none'}`;
 
     $('metric-position').textContent = position ? `${position.symbol} ${number(position.quantity, 8)}` : 'SEM POSIÇÃO';
-    $('metric-position-detail').textContent = position ? `Custo: ${money(position.costUsdt)} (Médio: ${money(position.costUsdt / position.quantity)})` : '—';
+    $('metric-position-detail').textContent = positionDetail(position);
     $('metric-trades').textContent = String(trades.length);
 
     $('metric-ai-cost').textContent = money(account.aiCostUsd, 'US$', 4);
@@ -81,7 +118,10 @@
     chart('models-chart', 'bar', payload.aiUsage.models.map((model) => model.model), [{ label: 'Chamadas', data: payload.aiUsage.models.map((model) => model.calls), backgroundColor: '#0d6efd' }], { indexAxis: 'y', scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } });
   }
   function renderTables(payload) {
-    $('trades-table').innerHTML = payload.trades.length ? payload.trades.map((trade) => `<tr><td>${time(trade.at)}</td><td>${badge(trade.side)}</td><td>${number(trade.netQuantity ?? trade.quantity, 0)}</td><td>${trade.quantity ? money(trade.quoteAmount / trade.quantity) : '—'}</td><td>${money(trade.netQuoteAmount ?? trade.quoteAmount)}</td><td>${money(trade.feesUsdtKnown)}</td><td class="${Number(trade.netPnlUsdt) < 0 ? 'text-danger' : Number(trade.netPnlUsdt) > 0 ? 'text-success' : ''}">${trade.netPnlUsdt === null ? '—' : signedMoney(trade.netPnlUsdt)}</td><td class="font-monospace small">${escape(trade.brokerOrderId)}</td></tr>`).join('') : empty(8, 'Nenhum trade no dia.');
+    $('trades-table').innerHTML = payload.trades.length ? payload.trades.map((trade) => {
+      const pnl = tradePnl(trade);
+      return `<tr><td>${time(trade.at)}</td><td>${badge(trade.side)}</td><td>${number(trade.netQuantity ?? trade.quantity, 0)}</td><td>${trade.quantity ? money(trade.quoteAmount / trade.quantity) : '—'}</td><td>${money(trade.quoteAmount)}</td><td>${money(trade.feesUsdtKnown)}</td><td class="${pnl.tone}"${pnl.title ? ` title="${escape(pnl.title)}"` : ''}>${pnl.text}</td><td class="font-monospace small">${escape(trade.brokerOrderId)}</td></tr>`;
+    }).join('') : empty(8, 'Nenhum trade no dia.');
     $('decisions-table').innerHTML = payload.decisions.length ? payload.decisions.map((decision) => `<tr class="${decision.actionRequested !== decision.actionAfterRisk ? 'table-warning' : ''}"><td>${time(decision.at)}</td><td class="small">${escape(decision.model)}</td><td>${badge(decision.actionRequested)}</td><td>${badge(decision.actionAfterRisk)}</td><td>${money(decision.amountAfterRisk)}</td><td>${number(decision.confidence * 100, 0)}%</td><td class="reason">${escape(decision.reason)}</td><td class="reason">${escape(decision.rejectionReason)}</td></tr>`).join('') : empty(8, 'Nenhuma decisão no dia.');
     renderEvents();
   }
@@ -110,15 +150,25 @@
   }
   async function load() {
     const selected = $('date-filter').value || today();
+    let payload;
     try {
       const response = await fetch(`/dashboard/data?date=${encodeURIComponent(selected)}`, { cache: 'no-store' });
       if (!response.ok) throw new Error('API indisponível');
-      render(await response.json());
+      payload = await response.json();
     } catch {
       $('connection').textContent = 'CONEXÃO PERDIDA — dados não estão atualizados';
       $('connection').className = 'small text-danger fw-bold';
       $('overall-status').textContent = 'CONEXÃO PERDIDA';
       $('overall-status').className = 'badge text-bg-danger px-3 py-2';
+      return;
+    }
+    try {
+      render(payload);
+    } catch (error) {
+      // Rendering bugs must not masquerade as a lost connection.
+      console.error('Falha ao renderizar painel', error);
+      $('connection').textContent = `ERRO DE EXIBIÇÃO — ${error instanceof Error ? error.message : 'falha desconhecida'}`;
+      $('connection').className = 'small text-warning fw-bold';
     }
   }
   $('date-filter').value = today();

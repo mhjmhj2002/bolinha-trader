@@ -4,17 +4,46 @@ import { z } from 'zod';
 
 const bool = z.enum(['true', 'false']).default('false').transform((v) => v === 'true');
 const numeric = (fallback: number) => z.coerce.number().finite().default(fallback);
+/** Canonical timeframe set used by the multi-timeframe entry (BUY) confluence filter. */
+export const entryTimeframes = ['1m', '5m', '15m'] as const;
+export type EntryTimeframe = (typeof entryTimeframes)[number];
+const entryTimeframeList = z
+  .string()
+  .default(entryTimeframes.join(','))
+  .transform((value): EntryTimeframe[] => {
+    const requested = value.split(',').map((entry) => entry.trim().toLowerCase());
+    const selected = entryTimeframes.filter((timeframe) => requested.includes(timeframe));
+    // An unusable list falls back to the safe default instead of disabling the filter.
+    return selected.length ? [...selected] : [...entryTimeframes];
+  });
 const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   DATABASE_URL: z.string().url().default('postgres://bolinha:bolinha@localhost:5432/bolinha'),
   API_HOST: z.string().default('127.0.0.1'), API_PORT: numeric(3000),
   OPENROUTER_API_KEY: z.string().default(''),
-  OPENROUTER_MODELS: z.string().default('google/gemini-2.5-flash,google/gemini-2.0-flash-001,deepseek/deepseek-chat,meta-llama/llama-3.3-70b-instruct,mistralai/mistral-small-24b-instruct-2501'),
+  OPENROUTER_MODELS: z.string().default('google/gemini-2.5-flash,deepseek/deepseek-chat,meta-llama/llama-3.3-70b-instruct,mistralai/mistral-small-24b-instruct-2501'),
   OPENROUTER_TIMEOUT_MS: numeric(30_000),
   INTERVAL_SECONDS: numeric(180),
   STOP_LOSS_PCT: numeric(0.012),
   MAX_STOP_LOSS_PCT: numeric(0.018),
   SYMBOL: z.string().default('PETR4'), TRADING_LOOP_ENABLED: bool,
+  // Multi-timeframe entry (BUY) confluence filter: deterministic gate that blocks
+  // buys at the top of transient noise. Insufficient/invalid data always holds.
+  ENTRY_FILTER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+  ENTRY_TIMEFRAMES: entryTimeframeList,
+  ENTRY_MIN_CONFLUENT_TIMEFRAMES: numeric(3),
+  ENTRY_RSI_OVERBOUGHT: numeric(70),
+  // Synthetic B3 market model (packages/exchange/src/b3/market-data.ts): intraday momentum waves.
+  SYNTHETIC_VOLATILITY: z.coerce.number().finite().positive().max(0.2).default(0.001),
+  SYNTHETIC_MOMENTUM_DRIFT: z.coerce.number().finite().min(0).max(0.05).default(0.00075),
+  SYNTHETIC_TREND_SEGMENT_CANDLES: z.coerce.number().int().min(1).max(1440).default(26),
+  SYNTHETIC_REGIME_FLIP_PROBABILITY: z.coerce.number().finite().min(0).max(1).default(0.6),
+  SYNTHETIC_CONSOLIDATION_PROBABILITY: z.coerce.number().finite().min(0).max(1).default(0.15),
+  SYNTHETIC_PULLBACK_PROBABILITY: z.coerce.number().finite().min(0).max(0.9).default(0.3),
+  SYNTHETIC_MAX_TREND_RUN: z.coerce.number().int().min(2).max(240).default(12),
+  SYNTHETIC_MEAN_REVERSION: z.coerce.number().finite().min(0).max(0.5).default(0.014),
+  SYNTHETIC_PRICE_BOUND_PCT: z.coerce.number().finite().gt(0).max(0.5).default(0.08),
+  SYNTHETIC_SEED: z.coerce.number().int().min(0).default(0),
 });
 export type Config = z.infer<typeof configSchema>;
 export const config = configSchema.parse(process.env);

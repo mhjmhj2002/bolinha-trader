@@ -6,6 +6,14 @@ describe('indicators', () => {
     const x = calculateIndicators(candles);
     expect(x.emaRelation).toBe('EMA9_ABOVE_EMA21');
     expect(x.volumeState).toBe('HIGH');
+    // BUG-10 guard: a double-counted EMA seed would push both EMAs (~2x price, e.g. 200..258)
+    // above the price band. The relation check above alone passes even with that bug.
+    const minClose = Math.min(...candles.map((c) => c.close));
+    const maxClose = Math.max(...candles.map((c) => c.close));
+    expect(x.ema9).toBeGreaterThanOrEqual(minClose - 1e-9);
+    expect(x.ema9).toBeLessThanOrEqual(maxClose + 1e-9);
+    expect(x.ema21).toBeGreaterThanOrEqual(minClose - 1e-9);
+    expect(x.ema21).toBeLessThanOrEqual(maxClose + 1e-9);
   });
 
   it('normalizes return state', () => {

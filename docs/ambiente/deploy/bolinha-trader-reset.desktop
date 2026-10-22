@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Bolinha Trader - Limpar Trades (Caixa R$ 100)
+Comment=Apaga trades/histórico e reseta o caixa para R$ 100 para novo teste
+Exec=bash -c 'export PATH="/snap/bin:$HOME/.local/bin:$PATH"; /home/mhj/git/bolinha-trader/docs/ambiente/deploy/reset-trades.sh'
+Icon=edit-clear
+Path=/home/mhj/git/bolinha-trader
+Terminal=true
+Categories=Development;Utility;
+StartupNotify=true

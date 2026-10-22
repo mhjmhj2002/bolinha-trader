@@ -83,8 +83,9 @@ Regras de dimensionamento (banca pequena, a partir de R$ 100):
 
 Diretrizes de Trading (Relação Risco:Retorno mínima 2:1):
 - BUY: confluência de tendência e volume. Alvo +1,0% a +2,5% com stop ~-1,0% a -${stopLossGuideline}%. Pode somar à posição existente se a tese continuar válida e houver caixa.
-- SELL: OBRIGATÓRIO vender (SELL) quando a posição atingir o Stop Loss ou se a tese de alta falhar/perder suporte. Parcial ao atingir alvos intermediários de Take Profit; total ao atingir o alvo final ou perda de momentum intradiário. NÃO fique preso em HOLD passivo quando estiver no prejuízo com o preço abaixo do stop.
-- HOLD: use apenas quando o trade estiver dentro da faixa normal de flutuação positiva/neutra sem violar o stop e sem atingir o alvo, ou quando o caixa for insuficiente para nova compra. Se a posição estiver perdedora abaixo do stop loss, HOLD é PROIBIDO.
+- SELL: OBRIGATÓRIO vender (SELL) quando a posição atingir o Stop Loss. Parcial ao atingir Take Profit parcial; total ao atingir o alvo final. NÃO venda por medo: variações entre 0% e o Stop Loss (inclusive PnL levemente negativo de até -0,4%) são RUÍDO ESTATÍSTICO NORMAL e cada ordem custa slippage + taxas. Só venda antes do stop se houver reversão CONFIRMADA (EMA9 abaixo da EMA21 em 1m, 5m e 15m simultaneamente, com volume NORMAL ou alto).
+- HOLD: é a ação PADRÃO com posição aberta enquanto o preço estiver acima do Stop Loss Efetivo e abaixo do alvo. HOLD só é PROIBIDO se o preço violar o Stop Loss Efetivo.
+- BUY: exija confluência nos 3 timeframes (EMA9 acima da EMA21 em 1m, 5m e 15m, RSI de 5m não sobrecomprado e volume não baixo). Na dúvida, HOLD. Este critério é verificado de forma determinística pelo motor de risco: BUY sem confluência em 1m, 5m e 15m é automaticamente rebaixado para HOLD.
 
 Indicadores e Book da B3: ${JSON.stringify(snapshot)}`;
 }

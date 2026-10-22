@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { config, defaultTradingConfiguration, logger, sessionPhase, type TradingConfiguration } from '@bolinha/core';
-import { makeSnapshot } from '@bolinha/market-data';
+import { evaluateCandlesEntryConfluence, makeSnapshot } from '@bolinha/market-data';
 import { OpenRouterClient, buildB3Prompt } from '@bolinha/ai';
 import { applyB3Risk } from '@bolinha/risk-engine';
 import { createBrokerGateway, type BrokerGateway, type ExchangeOrder } from '@bolinha/exchange';
@@ -22,6 +22,8 @@ export class TradingService {
       config.OPENROUTER_TIMEOUT_MS,
     ),
     private positionHighWatermark = new Map<string, number>(),
+    /** Signature (price@time) of the last persisted dashboard point, to avoid duplicates. */
+    private lastAccountSnapshot: string | null = null,
   ) {}
 
   private async event(severity: Severity, type: string, message: string, metadata?: unknown) {
@@ -66,6 +68,45 @@ export class TradingService {
     return { ready: true };
   }
 
+  /**
+   * BUG-10 parte C: every executed order must produce a new dashboard point.
+   * A force close (or any sale) that happens after the last decision cycle used
+   * to leave the panel showing a phantom position/cash. A snapshot failure is
+   * reported as an event but never discards an execution already committed to
+   * the ledger, and a missing price is never replaced by a made-up value.
+   */
+  private async snapshotAfterExecution(price: number, at: Date) {
+    const dashboardRepo = this.repo as TradingRepository & {
+      saveAccountSnapshot?: (price: number, at: Date) => Promise<void>;
+    };
+    // Lightweight unit-test doubles intentionally omit the dashboard writer.
+    if (!dashboardRepo.saveAccountSnapshot) return;
+    if (!Number.isFinite(price) || price <= 0) {
+      logger.warn({ price }, 'Account snapshot skipped after execution: no trustworthy price');
+      return;
+    }
+    // The force close is funnelled through persistExecution and then writes an
+    // explicit close-of-day point; the second call for the very same execution
+    // is redundant, so it is skipped. Recorded only after success, so a failed
+    // write is still retried by the next call site.
+    const signature = `${price}@${at.getTime()}`;
+    if (this.lastAccountSnapshot === signature) return;
+    try {
+      await dashboardRepo.saveAccountSnapshot(price, at);
+      this.lastAccountSnapshot = signature;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown account snapshot error';
+      try {
+        await this.event('ERROR', 'account_snapshot_failed', 'Account snapshot after execution could not be persisted', {
+          error: message,
+          price,
+        });
+      } catch (eventError) {
+        logger.error({ err: eventError }, 'Could not persist account_snapshot_failed event');
+      }
+    }
+  }
+
   private async persistExecution(
     local: { id: number; clientOrderId: string },
     order: Pick<ExchangeOrder, 'orderId' | 'side' | 'executedQty' | 'cummulativeQuoteQty' | 'commission' | 'transactTime'> & { fills?: ExchangeOrder['fills'] },
@@ -101,6 +142,11 @@ export class TradingService {
         'Conceptual position updated',
         { side: order.side, quantity: order.executedQty, netPositionQuantity: executionAccounting(order.side, order.executedQty, order.cummulativeQuoteQty, order.fills ?? []).positionQuantity, quoteAmount: order.cummulativeQuoteQty, source: eventType },
       );
+    // The panel reads cash/position/unrealized from PostgreSQL for the current
+    // day, but the time series still needs a point per executed order so a
+    // closing sale is visible even when no further decision cycle happens.
+    const executionPrice = order.executedQty > 0 ? order.cummulativeQuoteQty / order.executedQty : 0;
+    await this.snapshotAfterExecution(executionPrice, order.transactTime);
     return outcome;
   }
 
@@ -339,7 +385,32 @@ export class TradingService {
         throw error;
       }
       const [one, five, fifteen, account, position, rules, pending] = market;
-      const snapshot = makeSnapshot(config.SYMBOL, { '1m': one, '5m': five, '15m': fifteen });
+
+      // Filtro de entrada multi-timeframe (fail-closed): candle insuficiente,
+      // série ausente, indicador NaN ou falta de confluência 1m/5m/15m => BUY vira HOLD.
+      const entryConfluence = config.ENTRY_FILTER_ENABLED
+        ? evaluateCandlesEntryConfluence(
+            { '1m': one, '5m': five, '15m': fifteen },
+            {
+              timeframes: config.ENTRY_TIMEFRAMES,
+              minConfluentTimeframes: config.ENTRY_MIN_CONFLUENT_TIMEFRAMES,
+              rsiOverboughtThreshold: config.ENTRY_RSI_OVERBOUGHT,
+            },
+          )
+        : null;
+
+      let snapshot;
+      try {
+        snapshot = makeSnapshot(config.SYMBOL, { '1m': one, '5m': five, '15m': fifteen });
+      } catch (error) {
+        // Sem indicadores válidos não existe decisão confiável: HOLD observável, nunca BUY.
+        const message = error instanceof Error ? error.message : 'Invalid market data';
+        await this.event('WARN', 'cycle_skipped', 'Trading cycle held because market data is insufficient', {
+          reason: message,
+          entryConfluence: entryConfluence?.reason ?? null,
+        });
+        return { action: 'HOLD' as const, reason: `Insufficient market data: ${message}` };
+      }
       const snapshotId = await this.repo.saveSnapshot(snapshot);
       // One compact point per cycle keeps dashboard charts historical without
       // making the browser poll broker or the database directly.
@@ -393,8 +464,19 @@ export class TradingService {
         maxStopLossPct: config.MAX_STOP_LOSS_PCT, // Proteção rígida intradiária calibrada
         breakevenTriggerPct: 0.008, // Ativa breakeven ao atingir +0.8%
         trailingStopPct: 0.006, // Trailing stop de 0.6% a partir do topo
+        sellNoiseBandPct: 0.004, // SELL discricionário com |PnL| < 0.4% é ruído (atrito de slippage + taxas)
+        entryConfluence,
       });
       let risk = { action: b3Res.action, amountUsdt: b3Res.amountBrl, quantity: b3Res.quantity, rejectionReason: b3Res.rejectionReason };
+      if (response.decision.action === 'BUY' && risk.action !== 'BUY' && risk.rejectionReason?.startsWith('BUY rejected by multi-timeframe entry filter')) {
+        await this.event('WARN', 'entry_confluence_blocked_buy', 'BUY downgraded to HOLD by the multi-timeframe entry confluence filter', {
+          reason: risk.rejectionReason,
+          requiredCount: entryConfluence?.requiredCount ?? null,
+          confluentCount: entryConfluence?.confluentCount ?? null,
+          confluentTimeframes: entryConfluence?.confluentTimeframes ?? [],
+          checks: entryConfluence?.checks ?? [],
+        });
+      }
       if (phase === 'NO_NEW_POSITIONS' && risk.action === 'BUY') {
         risk = { action: 'HOLD', amountUsdt: 0, quantity: 0, rejectionReason: 'New positions are blocked for today' };
         await this.event('WARN', 'new_positions_blocked', 'BUY blocked during no-new-positions window', {
@@ -560,6 +642,11 @@ export class TradingService {
     }
     const order = await this.submitAndPersistOrder('SELL', risk.quantity, risk.amountUsdt);
     await this.event('WARN', 'force_close_completed', 'Forced close completed', { orderId: order.orderId });
+    // Explicit close-of-day point: the force close happens in a close-only tick
+    // that is followed by no further decision cycle, so this snapshot is what
+    // makes the post-sale cash/zero-position state visible to the dashboard.
+    const closePrice = order.executedQty > 0 ? order.cummulativeQuoteQty / order.executedQty : price;
+    await this.snapshotAfterExecution(closePrice, order.transactTime);
     return { action: 'SELL', orderId: order.orderId };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown force-close error';
