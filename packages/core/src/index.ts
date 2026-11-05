@@ -1,6 +1,10 @@
 import 'dotenv/config';
 import pino from 'pino';
 import { z } from 'zod';
+import { B3_DEFAULT_BUY_COST_BUFFER_PCT, B3_MAX_BUY_COST_BUFFER_PCT } from './b3-costs.js';
+
+export * from './b3-costs.js';
+export * from './rounding.js';
 
 const bool = z.enum(['true', 'false']).default('false').transform((v) => v === 'true');
 const numeric = (fallback: number) => z.coerce.number().finite().default(fallback);
@@ -16,23 +20,78 @@ const entryTimeframeList = z
     // An unusable list falls back to the safe default instead of disabling the filter.
     return selected.length ? [...selected] : [...entryTimeframes];
   });
-const configSchema = z.object({
+/** Defaults seguros das variáveis financeiras, alinhados aos valores que já eram
+ * efetivos em runtime (banca de R$ 100 e 100% de alocação por posição). */
+export const DEFAULT_INITIAL_BANK_BRL = 100;
+export const DEFAULT_MAX_POSITION_PERCENT = 100;
+export const configSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   DATABASE_URL: z.string().url().default('postgres://bolinha:bolinha@localhost:5432/bolinha'),
   API_HOST: z.string().default('127.0.0.1'), API_PORT: numeric(3000),
-  OPENROUTER_API_KEY: z.string().default(''),
+  // Chave de IA: vazia (ou só espaços) faz toda chamada OpenRouter retornar 401 e
+  // toda decisão cair no HOLD fail-closed. `validateStartupConfiguration` transforma
+  // esse cenário em WARN explícito no bootstrap; o trim normaliza o whitespace.
+  OPENROUTER_API_KEY: z.string().trim().default(''),
   OPENROUTER_MODELS: z.string().default('google/gemini-2.5-flash,deepseek/deepseek-chat,meta-llama/llama-3.3-70b-instruct,mistralai/mistral-small-24b-instruct-2501'),
   OPENROUTER_TIMEOUT_MS: numeric(30_000),
+  // TASK-38: Resiliência a rate limit (HTTP 429) e falhas transitórias com backoff exponencial e jitter
+  AI_RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(0).max(10).default(2),
+  AI_RETRY_BASE_DELAY_MS: numeric(1_000),
+  AI_RETRY_MAX_DELAY_MS: numeric(10_000),
+  // Confiança mínima para compras (BUY) quando decididas por modelo de fallback (default 0.70; modelos primários usam 0.50)
+  AI_FALLBACK_MIN_CONFIDENCE: z.coerce.number().finite().min(0).max(1).default(0.70),
   INTERVAL_SECONDS: numeric(180),
   STOP_LOSS_PCT: numeric(0.012),
   MAX_STOP_LOSS_PCT: numeric(0.018),
-  SYMBOL: z.string().default('PETR4'), TRADING_LOOP_ENABLED: bool,
+  STOP_LOSS_MODE: z.enum(['STATIC', 'ATR']).default('STATIC'),
+  ATR_MULTIPLIER: numeric(2.0),
+  BREAKEVEN_TRIGGER_PCT: numeric(0.005),
+  BREAKEVEN_PROFIT_LOCK_PCT: numeric(0.002),
+  TRAILING_STOP_PCT: numeric(0.004),
+  TRAILING_STOP_CAP_PCT: z.coerce.number().finite().positive().max(1).optional(),
+  PARTIAL_TAKE_PROFIT_TRIGGER_PCT: numeric(0.006),
+  PARTIAL_TAKE_PROFIT_RATIO: numeric(0.5),
+  FULL_TAKE_PROFIT_PCT: numeric(0.015),
+  // TASK-35: economia da entrada. BUY só passa se o alvo líquido compensar o risco e os custos.
+  // Razão mínima ganho líquido / perda líquida (alvo vs stop, ambos após custos de round-trip). 0 desativa.
+  MIN_REWARD_RISK_RATIO: z.coerce.number().finite().min(0).max(10).default(1.0),
+  // O alvo (take profit) precisa ser ao menos N vezes o custo de round-trip (slippage + emolumentos). 0 desativa.
+  MIN_TARGET_COST_MULTIPLE: z.coerce.number().finite().min(0).max(100).default(3),
+  // O stop precisa ser ao menos N vezes o ATR% do ativo (stop dentro do ruído é stopado à toa). 0 desativa.
+  MIN_STOP_ATR_MULTIPLE: z.coerce.number().finite().min(0).max(20).default(1.0),
+  // TASK-36: risco máximo por operação (fração do patrimônio). A quantidade do BUY é limitada para que a perda no
+  // stop + custos não exceda esse valor. 0 desativa (usa todo o caixa permitido por MAX_POSITION_PERCENT).
+  RISK_PER_TRADE_PCT: z.coerce.number().finite().min(0).max(1).default(0.005),
+  // TASK-40: Time-Stop (encerramento de posição sem progresso após N minutos com PnL líquido <= 0)
+  TIME_STOP_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+  TIME_STOP_MINUTES: numeric(45),
+  // TASK-40: Entrada escalonada (fração da quantidade para teste inicial de posição; 1.0 usa tamanho total)
+  ENTRY_SCALING_RATIO: z.coerce.number().finite().min(0.1).max(1.0).default(1.0),
+  // TASK-41: Cooldown mínimo em minutos entre tranches de aumento/escalonamento de posição aberta (0 desativa)
+  ENTRY_SCALING_COOLDOWN_MINUTES: numeric(5),
+  // TASK-40: Filtro de abertura de sessão (minutos iniciais do pregão sem novas compras; 0 desativa)
+  OPENING_NO_TRADE_MINUTES: numeric(0),
+  // Modo de cálculo de alvos de lucro: 'NET' considera custos B3 e IR de Day Trade (20%);
+  // 'GROSS' considera apenas a valorização percentual bruta nominal.
+  PROFIT_TARGET_CALCULATION_MODE: z.enum(['NET', 'GROSS']).default('NET'),
+  // Alíquota de Imposto de Renda para operações de Day Trade (padrão 20% = 0.20).
+  DAY_TRADE_TAX_RATE: z.coerce.number().finite().min(0).max(0.50).default(0.20),
+  SYMBOL: z.string().default('PETR4'),
+  SYMBOLS: z.string().default('PETR4,VALE3,ITUB4,BBDC4,BBAS3'),
+  TRADING_LOOP_ENABLED: bool,
   // Multi-timeframe entry (BUY) confluence filter: deterministic gate that blocks
   // buys at the top of transient noise. Insufficient/invalid data always holds.
   ENTRY_FILTER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   ENTRY_TIMEFRAMES: entryTimeframeList,
-  ENTRY_MIN_CONFLUENT_TIMEFRAMES: numeric(3),
+  ENTRY_MIN_CONFLUENT_TIMEFRAMES: numeric(2),
   ENTRY_RSI_OVERBOUGHT: numeric(70),
+  // TASK-37: Nível mínimo de RSI (ex: 35) para rejeitar compras em queda livre / faca caindo (0 desativa)
+  ENTRY_RSI_OVERSOLD: numeric(0),
+  // TASK-37: Extensão máxima permitida do preço acima da VWAP (ex: 0.015 = +1.5%; 0 desativa)
+  ENTRY_MAX_VWAP_DISTANCE_PCT: z.coerce.number().finite().min(0).max(0.10).default(0),
+  // TASK-37: Extensão máxima permitida do preço acima da EMA21 (ex: 0.015 = +1.5%; 0 desativa)
+  ENTRY_MAX_EMA_DISTANCE_PCT: z.coerce.number().finite().min(0).max(0.10).default(0),
+  ENTRY_REQUIRE_VWAP_ABOVE: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   // Synthetic B3 market model (packages/exchange/src/b3/market-data.ts): intraday momentum waves.
   SYNTHETIC_VOLATILITY: z.coerce.number().finite().positive().max(0.2).default(0.001),
   SYNTHETIC_MOMENTUM_DRIFT: z.coerce.number().finite().min(0).max(0.05).default(0.00075),
@@ -44,25 +103,140 @@ const configSchema = z.object({
   SYNTHETIC_MEAN_REVERSION: z.coerce.number().finite().min(0).max(0.5).default(0.014),
   SYNTHETIC_PRICE_BOUND_PCT: z.coerce.number().finite().gt(0).max(0.5).default(0.08),
   SYNTHETIC_SEED: z.coerce.number().int().min(0).default(0),
-});
+  // Headroom extra (além de slippage + emolumentos reais) reservado pelo motor de
+  // risco ao dimensionar um BUY. Fail-closed: valor maior só reduz a quantidade;
+  // nunca é aceito valor negativo (isso aprovaria ordens que o broker rejeita).
+  RISK_BUY_COST_BUFFER_PCT: z.coerce.number().finite().min(0).max(B3_MAX_BUY_COST_BUFFER_PCT)
+    .default(B3_DEFAULT_BUY_COST_BUFFER_PCT),
+  // Banca inicial (em BRL) usada pelo paper broker da B3 e pelo ledger PostgreSQL
+  // no bootstrap. `INITIAL_BANK_USDT` é um alias legado (a operação é 100% B3/paper
+  // desde a TASK-08, não existe mais mercado USDT): a consolidação abaixo resolve
+  // UM único valor canônico (`Config.INITIAL_BANK_BRL`) e nunca cria a segunda
+  // fonte de verdade. Nenhum dos dois é removido do objeto — antes, ambos eram
+  // silenciosamente descartados pelo `z.object()`.
+  INITIAL_BANK_BRL: z.coerce.number().finite().positive().optional(),
+  /** Alias legado de `INITIAL_BANK_BRL`; só é usado quando o canônico está ausente. */
+  INITIAL_BANK_USDT: z.coerce.number().finite().positive().optional(),
+  // Limite diário de perda máxima (Daily Loss Limit / Circuit Breaker).
+  // Se realizedPnlBrl acumulado no dia for <= -limite, bloqueia novas entradas (BUY)
+  // protegendo a banca contra sequências negativas intradiárias.
+  DAILY_MAX_LOSS_PCT: z.coerce.number().finite().positive().max(1).default(0.05),
+  DAILY_MAX_LOSS_BRL: z.coerce.number().finite().positive().optional(),
+  // Teto de alocação por posição consumido por `applyB3Risk`
+  // (`(caixa + posição) * MAX_POSITION_PERCENT / 100`). A linha da tabela
+  // `trading_configuration` é autoritativa em runtime; esta entrada tipada é o
+  // fallback/default validado do bootstrap. Bounds alinhados a
+  // `validateTradingConfiguration` (0, 100] — acima de 100% não haveria lastro.
+  MAX_POSITION_PERCENT: z.coerce.number().finite().gt(0).max(100).default(DEFAULT_MAX_POSITION_PERCENT),
+  // Ingestão em Tempo Real (WebSocket / Ticks)
+  WS_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+  WS_HOST: z.string().default('127.0.0.1'),
+  WS_PORT: numeric(8080),
+  WS_PATH: z.string().default('/ws/ticks'),
+})
+  // Consolida o alias legado `INITIAL_BANK_USDT` em `INITIAL_BANK_BRL` para que
+  // exista um único valor canônico, tipado e efetivo em runtime.
+  .transform((value) => ({
+    ...value,
+    INITIAL_BANK_BRL: value.INITIAL_BANK_BRL ?? value.INITIAL_BANK_USDT ?? DEFAULT_INITIAL_BANK_BRL,
+  }));
 export type Config = z.infer<typeof configSchema>;
 export const config = configSchema.parse(process.env);
+
+/**
+ * Retorna a lista canônica de tickers a serem monitorados pelo scanner multi-ativos.
+ * Faz parse da string `SYMBOLS` (separada por vírgula), normaliza para maiúsculas e remove vazios.
+ * Se `SYMBOLS` estiver vazio, usa `[config.SYMBOL]`.
+ */
+export function parseTradingSymbols(symbolsString?: string, fallbackSymbol?: string): string[] {
+  const source = symbolsString ?? config.SYMBOLS;
+  const fallback = (fallbackSymbol ?? config.SYMBOL ?? 'PETR4').trim().toUpperCase();
+  if (!source || typeof source !== 'string') return [fallback];
+  const list = source
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => s.length > 0);
+  return list.length > 0 ? Array.from(new Set(list)) : [fallback];
+}
+
 export const logger = pino({ level: process.env.LOG_LEVEL ?? 'info', redact: ['OPENROUTER_API_KEY', '*.apiKey', '*.secret'] });
 
+export interface StartupValidation {
+  /** `false` quando `OPENROUTER_API_KEY` está vazia/só espaços. */
+  openRouterApiKeyConfigured: boolean;
+  warnings: string[];
+}
+
+/**
+ * Validação de bootstrap das variáveis que não podem falhar em silêncio.
+ * Nunca lança: a API e o worker continuam no ar (health/dashboard) e a operação
+ * segue fail-closed — sem chave de IA toda decisão vira HOLD. O objetivo é tornar
+ * a causa raiz visível no log de startup em vez de degradar sem aviso.
+ */
+export const validateStartupConfiguration = (
+  source: Pick<Config, 'OPENROUTER_API_KEY'> = config,
+  log: Pick<typeof logger, 'warn'> = logger,
+): StartupValidation => {
+  const warnings: string[] = [];
+  const openRouterApiKeyConfigured = source.OPENROUTER_API_KEY.trim().length > 0;
+  if (!openRouterApiKeyConfigured) {
+    const message =
+      'OPENROUTER_API_KEY is missing or blank: every AI call will be rejected (401) and every decision will be HOLD. Trading is disabled until a valid key is configured.';
+    warnings.push(message);
+    log.warn(
+      { event: 'openrouter_api_key_missing', openRouterApiKeyConfigured: false, decisions: 'HOLD' },
+      message,
+    );
+  }
+  return { openRouterApiKeyConfigured, warnings };
+};
+
 export type Action = 'BUY' | 'SELL' | 'HOLD';
-export interface Position { quantity: number; entryPrice: number; costUsdt: number; openedAt: Date }
+export interface Position {
+  quantity: number;
+  entryPrice: number;
+  costUsdt: number;
+  openedAt: Date;
+  symbol?: string;
+}
 export interface Account { initialBankUsdt: number; cashUsdt: number; realizedPnlUsdt: number; aiCostUsd: number }
 export interface SymbolRules { minNotional: number; minQty: number; stepSize: number }
 export const now = () => new Date();
-export const roundStepDown = (value: number, step: number) => Math.floor((value + 1e-12) / step) * step;
+
+export interface MarketTickEvent {
+  symbol: string;
+  price: number;
+  volume?: number;
+  timestamp: number;
+}
+
+export interface MarketCandleEvent {
+  symbol: string;
+  interval: '1m' | '5m' | '15m';
+  candle: {
+    openTime: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    closeTime: number;
+  };
+}
 
 export type SessionPhase = 'BEFORE_START' | 'TRADING' | 'NO_NEW_POSITIONS' | 'FORCE_CLOSE' | 'FORCE_CLOSE_PENDING' | 'FINISHED';
 export interface SessionSchedule { timezone: string; start: string; stopNewPositions: string; forceClose: string; end: string; intervalSeconds: number }
-export interface TradingConfiguration extends SessionSchedule { initialBankUsdt: number; maxPositionPercent: number; updatedAt?: Date | null }
+export interface TradingConfiguration extends SessionSchedule {
+  initialBankUsdt: number;
+  maxPositionPercent: number;
+  trailingStopCapPct?: number;
+  updatedAt?: Date | null;
+}
 /** Bootstrap values only. Runtime operational behaviour must use PostgreSQL. */
 export const defaultTradingConfiguration: TradingConfiguration = Object.freeze({
-  timezone: 'America/Sao_Paulo', start: '09:00', stopNewPositions: '17:50', forceClose: '17:55', end: '18:00',
-  intervalSeconds: config.INTERVAL_SECONDS, initialBankUsdt: 100, maxPositionPercent: 100,
+  timezone: 'America/Sao_Paulo', start: '09:00', stopNewPositions: '16:45', forceClose: '17:15', end: '18:00',
+  intervalSeconds: config.INTERVAL_SECONDS, initialBankUsdt: config.INITIAL_BANK_BRL, maxPositionPercent: config.MAX_POSITION_PERCENT,
+  trailingStopCapPct: config.TRAILING_STOP_CAP_PCT,
 });
 export const sessionSchedule = (configuration: Pick<TradingConfiguration, 'timezone' | 'start' | 'stopNewPositions' | 'forceClose' | 'end' | 'intervalSeconds'> = defaultTradingConfiguration): SessionSchedule => ({ ...configuration });
 const timeValue = /^([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
@@ -77,6 +251,8 @@ export const validateTradingConfiguration = (value: TradingConfiguration): Tradi
   if (!Number.isInteger(value.intervalSeconds) || value.intervalSeconds <= 0) throw new Error('Configuration intervalSeconds must be positive');
   if (!Number.isFinite(value.initialBankUsdt) || value.initialBankUsdt <= 0) throw new Error('Configuration initialBankUsdt must be positive');
   if (!Number.isFinite(value.maxPositionPercent) || value.maxPositionPercent <= 0 || value.maxPositionPercent > 100) throw new Error('Configuration maxPositionPercent must be between 0 and 100');
+  if (value.trailingStopCapPct !== undefined && (!Number.isFinite(value.trailingStopCapPct) || value.trailingStopCapPct <= 0 || value.trailingStopCapPct > 1))
+    throw new Error('Configuration trailingStopCapPct must be positive and at most 1');
   return value;
 };
 const localParts = (at: Date, timezone: string) => Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(at).filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]));
@@ -101,7 +277,7 @@ const secondsOfDay = (time: string) => {
 /** Turns a local session date/time into its UTC instant without relying on the
  * process timezone. The small correction loop also keeps named IANA timezones
  * correct when their UTC offset changes. */
-const atSessionTime = (day: string, time: string, timezone: string) => {
+export const atSessionTime = (day: string, time: string, timezone: string) => {
   const [year, month, date] = day.split('-').map(Number);
   const [hour, minute, second = 0] = time.split(':').map(Number);
   const desired = Date.UTC(year, month - 1, date, hour, minute, second);
@@ -337,7 +513,7 @@ export const formatDailyReport = (report: DailyReport): string => {
     ? report.diagnostics.map((diagnostic) => `- [${diagnostic.severity}] ${diagnostic.message}`)
     : ['- Nenhum diagnóstico.'];
   return [
-    `Operação Bolinha de Gude — ${report.date}`,
+    `Bolinha Trader — ${report.date}`,
     '',
     'Sessão',
     `${report.schedule.start} → ${report.schedule.end}`,

@@ -157,6 +157,7 @@ export class B3MetaTraderBridge implements BrokerGateway {
       fills,
       commission: Number(data.commission ?? fills.reduce((acc, f) => acc + f.commission, 0)),
       transactTime: data.transactTime ? new Date(data.transactTime) : new Date(),
+      ticker: String(data.symbol ?? data.ticker ?? this.ticker),
     };
   }
 }

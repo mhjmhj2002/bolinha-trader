@@ -17,6 +17,14 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 # Cria pasta de logs caso não exista
 mkdir -p "${LOG_DIR}"
 
+# Estado global compartilhado (preenchido por init_logging / capture_runtime_logs)
+LOG_FILE=""
+LOG_TS=""
+APP_NAME=""
+LOG_STARTED_ISO=""
+TEST_LOG_FILE=""
+RUNTIME_LOG_FILES=()
+
 # Obtém timestamp no padrão yyyy-mm-dd-hh-mm-ss
 get_timestamp() {
   date +'%Y-%m-%d-%H-%M-%S'
@@ -74,6 +82,17 @@ init_logging() {
   ts="$(get_timestamp)"
   LOG_FILE="${LOG_DIR}/${ts}-${app_name}-log.txt"
 
+  # Timestamp e app da execução corrente: reutilizados para nomear os arquivos
+  # satélites (saída de testes e logs de runtime) com o MESMO timestamp do log
+  # principal, permitindo correlacionar todos os artefatos de uma execução.
+  LOG_TS="${ts}"
+  APP_NAME="${app_name}"
+  # Instante (UTC, RFC3339) de início da execução: base do `docker compose logs --since`
+  LOG_STARTED_ISO="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  # Fronteira temporal da captura de runtime (sobrescrevível por variável de ambiente)
+  : "${RUNTIME_LOG_SINCE:=${LOG_STARTED_ISO}}"
+  export RUNTIME_LOG_SINCE
+
   # Duplica stdout e stderr para o arquivo de log e para os descritores de terminal originais
   exec 3>&1 4>&2
   exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -81,7 +100,7 @@ init_logging() {
   echo "🚀 [bolinha-trader] Iniciando: ${script_name}"
   echo "🕒 Data/Hora: $(date +'%Y-%m-%d %H:%M:%S %Z')"
   echo "📁 Repositório: ${REPO_ROOT}"
-  echo "📄 Log de saída: ${LOG_FILE}"
+  echo "📄 Log de saída (build/deploy): ${LOG_FILE}"
   echo "========================================================================"
 }
 
@@ -102,7 +121,16 @@ finish_logging() {
     echo "❌ [bolinha-trader] Execução falhou com código de saída: ${exit_code}"
   fi
   echo "🕒 Fim: $(date +'%Y-%m-%d %H:%M:%S %Z')"
-  echo "📄 Log salvo em: ${LOG_FILE:-${LOG_DIR}}"
+  echo "📄 Log build/deploy: ${LOG_FILE:-${LOG_DIR}}"
+  echo "🧪 Log de testes (FIXTURES, não é produção): ${TEST_LOG_FILE:-<não executado nesta execução>}"
+  local rf
+  if [ ${#RUNTIME_LOG_FILES[@]} -gt 0 ]; then
+    for rf in "${RUNTIME_LOG_FILES[@]}"; do
+      echo "🟢 Log de runtime (PRODUÇÃO): ${rf}"
+    done
+  else
+    echo "🟢 Log de runtime (PRODUÇÃO): <não capturado — use 'docker compose logs' conforme o README>"
+  fi
   echo "========================================================================"
 
   # Mantém o terminal aberto se solicitado por PAUSE_ON_CLOSE=true ou caso não seja um subshell temporário
@@ -238,6 +266,219 @@ stop_if_running() {
   fi
 }
 
+# --- Delimitação visível da saída de testes (vitest) -------------------------
+# A suíte emite linhas JSON de nível ERROR que são FIXTURES (ex.: "temporary B3
+# outage", "dashboard writer unavailable", "B3 Testnet HTTP 400 (-1021)...",
+# "broker unavailable while reconciling retry-after-outage"). Elas são
+# indistinguíveis de incidentes reais quando coladas no log de deploy.
+# Solução: faixa de marcadores inequívoca + arquivo dedicado (<ts>-<app>-test-log.txt).
+
+# Abre a seção de testes: banner no log de deploy e espelho em arquivo próprio
+test_log_start() {
+  local ts test_host
+  ts="$(get_timestamp)"
+  test_host="$(hostname 2>/dev/null || echo 'host-de-build')"
+  TEST_LOG_FILE="${LOG_DIR}/${LOG_TS:-${ts}}-${APP_NAME:-bolinha-trader}-test-log.txt"
+  : >"${TEST_LOG_FILE}"
+
+  echo ""
+  echo "################################################################################"
+  echo "# ===== INÍCIO SAÍDA DE TESTES (vitest) — NÃO SÃO EVENTOS DE PRODUÇÃO ====="
+  echo "################################################################################"
+  echo "# [$ts] [TESTES] Tudo entre esta faixa e o marcador de FIM é saída da suíte"
+  echo "# [$ts] [TESTES] automatizada, executada na máquina de build (hostname: ${test_host})."
+  echo "# [$ts] [TESTES] Linhas JSON 'ERROR' aqui são FIXTURES de teste; JAMAIS incidentes."
+  echo "# [$ts] [TESTES] Eventos reais de produção ficam nos arquivos *-runtime-log.txt,"
+  echo "# [$ts] [TESTES] cujo hostname é o ID do contêiner (ex.: 6c7e88124b62), não '${test_host}'."
+  echo "# [$ts] [TESTES] Cópia isolada desta seção: ${TEST_LOG_FILE}"
+  echo "################################################################################"
+
+  {
+    echo "################################################################################"
+    echo "# ===== INÍCIO SAÍDA DE TESTES (vitest) — NÃO SÃO EVENTOS DE PRODUÇÃO ====="
+    echo "################################################################################"
+    echo "# Arquivo.....: ${TEST_LOG_FILE}"
+    echo "# Log pai.....: ${LOG_FILE:-n/a}"
+    echo "# Host do build: ${test_host}"
+    echo "# [$ts] [TESTES] Linhas JSON 'ERROR' abaixo são FIXTURES de teste, JAMAIS incidentes."
+    echo "################################################################################"
+  } >>"${TEST_LOG_FILE}"
+}
+
+# Fecha a seção de testes com o resultado da suíte
+test_log_end() {
+  local status="${1:-0}"
+  local ts result_line
+  ts="$(get_timestamp)"
+  if [ "${status}" -eq 0 ]; then
+    result_line="# ===== FIM SAÍDA DE TESTES (vitest) — RESULTADO: SUCESSO ====="
+  else
+    result_line="# ===== FIM SAÍDA DE TESTES (vitest) — RESULTADO: FALHA (código ${status}) ====="
+  fi
+
+  echo "################################################################################"
+  echo "${result_line}"
+  echo "# [$ts] [TESTES] Acima: somente resultados de teste. Nenhum evento de produção."
+  echo "################################################################################"
+  echo ""
+
+  if [ -n "${TEST_LOG_FILE:-}" ]; then
+    {
+      echo "################################################################################"
+      echo "${result_line}"
+      echo "# [$ts] [TESTES] Acima: somente resultados de teste. Nenhum evento de produção."
+      echo "################################################################################"
+    } >>"${TEST_LOG_FILE}"
+  fi
+
+}
+
+# --- Captura de logs de RUNTIME dos contêineres -----------------------------
+# O log `<ts>-<app>-log.txt` cobre apenas build/deploy e termina segundos após os
+# contêineres subirem, sem nenhuma evidência do que o robô fez em runtime.
+# Aqui persistimos a saída real de cada contêiner em arquivo próprio:
+#   <logs>/<yyyy-mm-dd-hh-mm-ss>-<serviço>-runtime-log.txt
+# Estratégia DEFAULT = snapshot (nunca bloqueia o deploy):
+#   docker compose logs --no-color --timestamps --since <início> <serviço>
+# Streaming contínuo é OPT-IN e LIMITADO no tempo (ver follow_runtime_logs).
+
+# Caminho canônico do log de runtime de um serviço
+runtime_log_path() {
+  local service="$1"
+  local ts="${LOG_TS:-$(get_timestamp)}"
+  echo "${LOG_DIR}/${ts}-${service}-runtime-log.txt"
+}
+
+# Fronteira temporal da captura (início da execução do script, em UTC/RFC3339)
+runtime_log_since() {
+  echo "${RUNTIME_LOG_SINCE:-${LOG_STARTED_ISO:-}}"
+}
+
+# Grava o cabeçalho de demarcação no arquivo de runtime
+write_runtime_log_header() {
+  local file="$1" service="$2" since="$3"
+  {
+    echo "################################################################################"
+    echo "# ===== INÍCIO LOG DE RUNTIME — contêiner '${service}' (EVENTOS DE PRODUÇÃO) ====="
+    echo "################################################################################"
+    echo "# Arquivo........: ${file}"
+    echo "# Origem.........: docker compose logs --no-color --timestamps --since ${since} ${service}"
+    echo "# Capturado em...: $(date +'%Y-%m-%d %H:%M:%S %Z')"
+    echo "# Escopo.........: somente saída real do contêiner (hostname = ID do contêiner)."
+    echo "# [AVISO] Fixtures de teste NÃO aparecem aqui; veja <ts>-<app>-test-log.txt."
+    echo "################################################################################"
+  } >>"${file}"
+}
+
+# Snapshot dos logs de runtime de um ou mais serviços (padrão seguro, não bloqueante)
+capture_runtime_logs() {
+  local since_arg=""
+  if [ "$1" = "--since" ]; then
+    since_arg="$2"
+    shift 2
+  fi
+  local services=("$@")
+  if [ ${#services[@]} -eq 0 ]; then
+    log_warn "capture_runtime_logs chamado sem serviços; nada a capturar."
+    return 0
+  fi
+
+  local since
+  if [ -n "${since_arg}" ]; then
+    since="${since_arg}"
+  else
+    since="$(runtime_log_since)"
+  fi
+  if [ -z "${since}" ]; then
+    since="2 hours ago"
+    log_warn "Instante de início da execução desconhecido; capturando runtime com --since '${since}'."
+  fi
+
+  echo ""
+  echo "################################################################################"
+  echo "# ===== INÍCIO CAPTURA DE LOGS DE RUNTIME (EVENTOS DE PRODUÇÃO) ====="
+  echo "################################################################################"
+  log_info "Capturando logs de runtime (docker compose logs --since ${since}) dos serviços: ${services[*]}"
+
+  local s file
+  for s in "${services[@]}"; do
+    file="$(runtime_log_path "${s}")"
+    : >"${file}"
+    write_runtime_log_header "${file}" "${s}" "${since}"
+    if (cd "${REPO_ROOT}" && docker compose logs --no-color --timestamps --since "${since}" "${s}" >>"${file}" 2>&1); then
+      RUNTIME_LOG_FILES+=("${file}")
+      log_success "Log de runtime de '${s}' salvo em: ${file}"
+    else
+      log_warn "Não foi possível capturar o log de runtime de '${s}' (arquivo: ${file})."
+    fi
+  done
+
+  show_runtime_log_help "${services[@]}"
+  echo "################################################################################"
+  echo "# ===== FIM CAPTURA DE LOGS DE RUNTIME ====="
+  echo "################################################################################"
+  echo ""
+}
+
+# Instruções exatas de acompanhamento/consulta dos logs de runtime
+show_runtime_log_help() {
+  local services=("$@")
+  local since
+  since="$(runtime_log_since)"
+  local s file
+  echo "# --------------------------------------------------------------------------"
+  echo "# Como acompanhar o runtime em tempo real (todos os comandos são manuais):"
+  echo "#   1) Snapshot novo (sobrescreve o arquivo do timestamp corrente):"
+  echo "#      docker compose logs --no-color --timestamps --since ${since} <serviço> \\"
+  echo "#        > ${LOG_DIR}/<timestamp>-<serviço>-runtime-log.txt"
+  echo "#   2) Acompanhamento contínuo no terminal (Ctrl+C para sair):"
+  echo "#      docker compose logs --no-color --timestamps -f worker"
+  echo "#   3) Acompanhamento limitado no tempo (não trava a sessão):"
+  echo "#      timeout 300 docker compose logs --no-color --timestamps --since ${since} -f worker"
+  echo "#   4) Opt-in dentro do próprio script de deploy (limitado a"
+  echo "#      RUNTIME_LOG_FOLLOW_SECONDS=180s, configurável):"
+  echo "#      RUNTIME_LOG_FOLLOW=true RUNTIME_LOG_FOLLOW_SECONDS=300 ./docs/ambiente/deploy/deploy.sh"
+  echo "#"
+  for s in "${services[@]}"; do
+    file="$(runtime_log_path "${s}")"
+    echo "#   runtime de '${s}': ${file}"
+  done
+  echo "# --------------------------------------------------------------------------"
+}
+
+# OPT-IN: acompanhamento contínuo por tempo LIMITADO de RUNTIME_LOG_FOLLOW_SECONDS.
+# Nunca é o padrão porque `docker logs -f` travaria o script de deploy para sempre.
+follow_runtime_logs() {
+  local services=("$@")
+  if [ "${RUNTIME_LOG_FOLLOW:-false}" != "true" ]; then
+    return 0
+  fi
+
+  local secs="${RUNTIME_LOG_FOLLOW_SECONDS:-180}"
+  if ! command -v timeout >/dev/null 2>&1; then
+    log_warn "RUNTIME_LOG_FOLLOW=true ignorado: comando 'timeout' indisponível (evita travar o deploy)."
+    return 0
+  fi
+
+  local since
+  since="$(runtime_log_since)"
+  log_info "RUNTIME_LOG_FOLLOW=true: acompanhando logs de runtime por até ${secs}s (opt-in, limitado)."
+
+  local s file rc
+  for s in "${services[@]}"; do
+    file="$(runtime_log_path "${s}")"
+    (cd "${REPO_ROOT}" && timeout "${secs}" docker compose logs --no-color --timestamps --since "${since}" -f "${s}" >>"${file}" 2>&1)
+    rc=$?
+    if [ "${rc}" -eq 124 ]; then
+      log_success "Acompanhamento de '${s}' encerrado pelo limite de ${secs}s (comportamento esperado)."
+    elif [ "${rc}" -eq 0 ]; then
+      log_info "Acompanhamento de '${s}' encerrado pelo serviço."
+    else
+      log_warn "Acompanhamento de '${s}' terminou com código ${rc}."
+    fi
+  done
+}
+
 # Valida código (install, typecheck, testes, build TS) apenas para serviços Node/TS
 validate_code() {
   cd "${REPO_ROOT}"
@@ -246,7 +487,23 @@ validate_code() {
   log_info "Typecheck, lint e testes..."
   pnpm typecheck
   pnpm lint
-  NODE_ENV=test pnpm test
+
+  # Fase de testes: delimitada por banner e espelhada em arquivo próprio,
+  # para que fixtures ('temporary B3 outage', 'dashboard writer unavailable',
+  # 'B3 Testnet HTTP 400 (-1021)') nunca sejam lidas como incidentes de produção.
+  test_log_start
+  local test_status=0
+  set +e
+  NODE_ENV=test pnpm test 2>&1 | tee -a "${TEST_LOG_FILE}"
+  test_status=${PIPESTATUS[0]}
+  set -e
+  test_log_end "${test_status}"
+
+  if [ "${test_status}" -ne 0 ]; then
+    log_error "Suíte de testes falhou (código ${test_status}). Abortando por segurança financeira."
+    exit "${test_status}"
+  fi
+
   pnpm build
 }
 
@@ -357,6 +614,13 @@ run_deploy() {
   for s in "$@"; do build_service "${s}"; done
   for s in "$@"; do deploy_service "${s}"; done
   for s in "${dependents[@]}"; do deploy_service "${s}"; done
+
+  # Persiste a saída real de runtime de cada serviço em <ts>-<serviço>-runtime-log.txt.
+  # Snapshot não bloqueante (sem `-f`); acompanhamento contínuo é opt-in e limitado.
+  local runtime_targets=("$@" "${dependents[@]}")
+  capture_runtime_logs "${runtime_targets[@]}"
+  follow_runtime_logs "${runtime_targets[@]}"
+
   show_status
   log_success "Deploy concluído: $*"
 }

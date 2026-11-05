@@ -75,5 +75,10 @@ deploy_service postgres
 deploy_service api
 deploy_service worker
 
+# Persiste a saída real de runtime (produção) em <ts>-<serviço>-runtime-log.txt.
+# Snapshot não bloqueante: NÃO usa `docker logs -f` por padrão (ver README).
+capture_runtime_logs postgres api worker
+follow_runtime_logs postgres api worker
+
 show_status
 log_success "Build e Deploy de todos os serviços finalizados com sucesso!"

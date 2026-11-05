@@ -1,6 +1,6 @@
 import { config } from '@bolinha/core';
-import { rsi, type Candle } from '@bolinha/market-data';
-import type { B3MarketDataProvider } from './types.js';
+import { rsi, evaluateCandlesEntryConfluence, makeSnapshot, type Candle } from '@bolinha/market-data';
+import type { B3MarketDataProvider, B3AssetSetup } from './types.js';
 
 /**
  * Tunables of the synthetic B3 candle model. Every field has a safe default
@@ -504,44 +504,109 @@ export class B3MarketDataService implements B3MarketDataProvider {
     return lastPrice;
   }
 
-  async scanAndRankSetups(tickers: string[] = ['PETR4', 'VALE3', 'ITUB4', 'BBDC4', 'BBAS3']): Promise<import('./types.js').B3AssetSetup[]> {
+  async scanAndRankSetups(
+    tickers: string[] = ['PETR4', 'VALE3', 'ITUB4', 'BBDC4', 'BBAS3'],
+    confluenceOptions?: {
+      timeframes?: readonly ('1m' | '5m' | '15m')[];
+      minConfluentTimeframes?: number;
+      rsiOverboughtThreshold?: number;
+      rsiOversoldThreshold?: number;
+      maxVwapDistancePct?: number;
+      maxEmaDistancePct?: number;
+      requireVwapAbove?: boolean;
+    },
+  ): Promise<B3AssetSetup[]> {
+    const opts = {
+      timeframes: confluenceOptions?.timeframes ?? config.ENTRY_TIMEFRAMES,
+      minConfluentTimeframes: confluenceOptions?.minConfluentTimeframes ?? config.ENTRY_MIN_CONFLUENT_TIMEFRAMES,
+      rsiOverboughtThreshold: confluenceOptions?.rsiOverboughtThreshold ?? config.ENTRY_RSI_OVERBOUGHT,
+      rsiOversoldThreshold: confluenceOptions?.rsiOversoldThreshold ?? config.ENTRY_RSI_OVERSOLD,
+      maxVwapDistancePct: confluenceOptions?.maxVwapDistancePct ?? config.ENTRY_MAX_VWAP_DISTANCE_PCT,
+      maxEmaDistancePct: confluenceOptions?.maxEmaDistancePct ?? config.ENTRY_MAX_EMA_DISTANCE_PCT,
+      requireVwapAbove: confluenceOptions?.requireVwapAbove ?? config.ENTRY_REQUIRE_VWAP_ABOVE,
+    };
+
     const results = await Promise.all(
       tickers.map(async (ticker) => {
         try {
-          const candles = await this.candles(ticker, '1m', 30);
-          if (candles.length < 2) return null;
-          const currentPrice = candles[candles.length - 1].close;
-          const firstPrice = candles[0].close;
+          const [c1m, c5m, c15m] = await Promise.all([
+            this.candles(ticker, '1m', 100),
+            this.candles(ticker, '5m', 100),
+            this.candles(ticker, '15m', 100),
+          ]);
+          if (c1m.length < 2) return null;
+          const currentPrice = c1m[c1m.length - 1].close;
+          const firstPrice = c1m[0].close;
           const momentumPct = Number((((currentPrice - firstPrice) / firstPrice) * 100).toFixed(2));
 
-          // Cálculo de RSI de 14 períodos com a função padronizada
-          const closes = candles.map((c) => c.close);
-          const rsi1m = rsi(closes, Math.min(14, closes.length - 1));
+          const closes1m = c1m.map((c) => c.close);
+          const rsi1m = rsi(closes1m, Math.min(14, closes1m.length - 1));
+
+          const confluence = evaluateCandlesEntryConfluence({ '1m': c1m, '5m': c5m, '15m': c15m }, opts);
+          let snapshot = null;
+          try {
+            snapshot = makeSnapshot(ticker, { '1m': c1m, '5m': c5m, '15m': c15m });
+          } catch {
+            snapshot = null;
+          }
 
           const trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' =
-            rsi1m >= 50 && momentumPct > 0 ? 'BULLISH' : rsi1m < 45 && momentumPct < 0 ? 'BEARISH' : 'NEUTRAL';
+            confluence.allowed
+              ? 'BULLISH'
+              : rsi1m >= 50 && momentumPct > 0
+                ? 'BULLISH'
+                : rsi1m < 45 && momentumPct < 0
+                  ? 'BEARISH'
+                  : 'NEUTRAL';
 
-          // Score: favorece momentum positivo com RSI em zona construtiva (45 a 65)
+          // Score: ativos com confluência permitida ganham bônus maciço (+100)
           let score = momentumPct * 10;
-          if (rsi1m >= 45 && rsi1m <= 65) score += 20;
-          else if (rsi1m > 75 || rsi1m < 30) score -= 15;
+          if (confluence.allowed) {
+            score += 100 + confluence.confluentCount * 20;
+          } else {
+            score += confluence.confluentCount * 10;
+          }
 
-          return {
+          if (rsi1m >= 45 && rsi1m <= 65) score += 15;
+          else if (rsi1m > 70 || rsi1m < 30) score -= 15;
+
+          // TASK-41: Priorizar ativos com volatilidade útil (ATR) e liquidez institucional,
+          // penalizando ativos estagnados em compressão severa de volatilidade (< 0.20% do preço).
+          const assetAtr = snapshot?.atr ?? snapshot?.intervals?.['5m']?.atr ?? snapshot?.intervals?.['1m']?.atr;
+          if (typeof assetAtr === 'number' && assetAtr > 0 && currentPrice > 0) {
+            const atrPct = (assetAtr / currentPrice) * 100;
+            if (atrPct >= 0.25 && atrPct <= 2.5) {
+              score += 15; // Volatilidade ideal para Day Trade
+            } else if (atrPct < 0.20) {
+              score -= 25; // Penalidade por estagnação / compressão severa (evita armadilhas de range estreito)
+            }
+          }
+
+          const setup: B3AssetSetup = {
             ticker: ticker.toUpperCase(),
             price: currentPrice,
             rsi1m,
             momentumPct,
             trend,
             score: Number(score.toFixed(2)),
+            confluence,
+            snapshot,
+            candles: { '1m': c1m, '5m': c5m, '15m': c15m },
           };
+          return setup;
         } catch {
           return null;
         }
       }),
     );
 
-    return (results.filter((r): r is import('./types.js').B3AssetSetup => r !== null))
-      .sort((a, b) => b.score - a.score);
+    const validSetups: B3AssetSetup[] = [];
+    for (const item of results) {
+      if (item !== null) {
+        validSetups.push(item);
+      }
+    }
+    return validSetups.sort((a, b) => b.score - a.score);
   }
 }
 

@@ -6,9 +6,10 @@ describe('São Paulo daily session window', () => {
   it.each([
     ['08:59', '2026-10-01T11:59:00Z', 'BEFORE_START'],
     ['09:00', '2026-10-01T12:00:00Z', 'TRADING'],
-    ['17:49', '2026-10-01T20:49:00Z', 'TRADING'],
-    ['17:50', '2026-10-01T20:50:00Z', 'NO_NEW_POSITIONS'],
-    ['17:55', '2026-10-01T20:55:00Z', 'FORCE_CLOSE'],
+    ['16:44', '2026-10-01T19:44:00Z', 'TRADING'],
+    ['16:45', '2026-10-01T19:45:00Z', 'NO_NEW_POSITIONS'],
+    ['17:14', '2026-10-01T20:14:00Z', 'NO_NEW_POSITIONS'],
+    ['17:15', '2026-10-01T20:15:00Z', 'FORCE_CLOSE'],
     ['18:00', '2026-10-01T21:00:00Z', 'FINISHED'],
   ])('%s maps to %s', (_label, iso, expected) => expect(phaseAt(iso)).toBe(expected));
 

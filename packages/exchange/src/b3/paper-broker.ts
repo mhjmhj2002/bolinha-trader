@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { Candle } from '@bolinha/market-data';
 import type { SymbolRules } from '@bolinha/core';
+import { B3_PAPER_SLIPPAGE_PCT, b3ExecutionPrice, config } from '@bolinha/core';
 import type { BrokerGateway, ExchangeOrder, ExchangeFill } from '../index.js';
 import { calculateB3Fees, getB3SymbolRules, parseB3Ticker } from './types.js';
 import { B3MarketDataService, defaultB3MarketDataService } from './market-data.js';
@@ -27,9 +28,12 @@ export class B3PaperBroker implements BrokerGateway {
 
   constructor(
     private ticker: string = 'PETR4',
-    initialBankBrl = 100.0,
+    // A banca inicial vem de `config.INITIAL_BANK_BRL` (`@bolinha/core`), nunca de um
+    // literal (AGENTS.md §2.2). O parâmetro continua opcional para chamadores que já
+    // conhecem a configuração operacional (ex.: linha `trading_configuration` no PG).
+    initialBankBrl: number = config.INITIAL_BANK_BRL,
     private marketData: B3MarketDataService = defaultB3MarketDataService,
-    private slippagePct = 0.0005, // 0.05% slippage simulado
+    private slippagePct = B3_PAPER_SLIPPAGE_PCT, // 0.05% slippage simulado (fonte única em @bolinha/core)
   ) {
     this.accountState = {
       initialBankBrl,
@@ -42,12 +46,34 @@ export class B3PaperBroker implements BrokerGateway {
     return this.marketData;
   }
 
+  setTicker(ticker: string): void {
+    this.ticker = ticker.trim().toUpperCase();
+  }
+
+  getTicker(): string {
+    return this.ticker;
+  }
+
   getAccount(): B3PaperAccount {
     return { ...this.accountState };
   }
 
   getPosition(): B3PositionState | null {
     return this.currentPosition ? { ...this.currentPosition } : null;
+  }
+
+  syncPosition(position: { ticker: string; quantity: number; entryPrice: number; costBrl: number } | null): void {
+    if (!position || position.quantity <= 0) {
+      this.currentPosition = null;
+    } else {
+      this.currentPosition = {
+        ticker: position.ticker.trim().toUpperCase(),
+        quantity: position.quantity,
+        entryPrice: position.entryPrice,
+        costBrl: position.costBrl,
+      };
+      this.ticker = this.currentPosition.ticker;
+    }
   }
 
   async candles(interval: '1m' | '5m' | '15m', limit = 100): Promise<Candle[]> {
@@ -89,8 +115,8 @@ export class B3PaperBroker implements BrokerGateway {
     }
 
     const currentPrice = await this.price();
-    const slippageFactor = side === 'BUY' ? (1 + this.slippagePct) : (1 - this.slippagePct);
-    const executionPrice = Number((currentPrice * slippageFactor).toFixed(2));
+    const slippagePct = side === 'BUY' ? this.slippagePct : -this.slippagePct;
+    const executionPrice = b3ExecutionPrice(currentPrice, slippagePct);
 
     if (side === 'SELL' && minPrice !== undefined && executionPrice < minPrice) {
       throw new Error(
@@ -155,6 +181,7 @@ export class B3PaperBroker implements BrokerGateway {
       fills: [fill],
       commission,
       transactTime: new Date(),
+      ticker: this.ticker,
     };
 
     this.orders.set(clientOrderId, order);

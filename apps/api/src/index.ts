@@ -1,15 +1,18 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { config, defaultTradingConfiguration, isSessionDay, logger, sessionDay, sessionPhase, validateTradingConfiguration } from '@bolinha/core';
+import { config, defaultTradingConfiguration, isSessionDay, logger, sessionDay, sessionPhase, validateStartupConfiguration, validateTradingConfiguration } from '@bolinha/core';
 import { ConfigurationBlockedError, TradingRepository } from '@bolinha/database';
 import { createBrokerGateway } from '@bolinha/exchange';
 import { TradingService } from '@bolinha/worker/service';
 const app=Fastify({loggerInstance:logger});const repo=new TradingRepository();const broker=createBrokerGateway(config.SYMBOL);const service=new TradingService(repo,broker);
+// Loud but non-fatal: the API must stay up to report health even without an AI key.
+validateStartupConfiguration(config, logger);
 const dashboardDirectory = resolve(import.meta.dirname, '../public/dashboard');
 const numberOrNull = (value: unknown) => value === null || value === undefined ? null : Number(value);
 const tradeResponse = (trade: Record<string, unknown>) => ({
   ...trade,
+  symbol: trade.symbol ? String(trade.symbol).toUpperCase() : config.SYMBOL,
   netQuantity: numberOrNull(trade.net_quantity), netQuoteAmount: numberOrNull(trade.net_quote_amount),
   grossPnlUsdt: numberOrNull(trade.gross_pnl_usdt), feesUsdtKnown: numberOrNull(trade.fees_usdt_known),
   netPnlUsdt: numberOrNull(trade.net_pnl_usdt), feesByAsset: trade.fees_by_asset,
@@ -43,7 +46,12 @@ app.get('/health', async () => {
   let database = 'UP'; let brokerStatus = 'UP'; let openRouter = 'UP';
   try { await repo.health(); } catch { database = 'DOWN'; }
   if (!(await broker.pingPublic())) brokerStatus = 'DOWN';
-  if (!config.OPENROUTER_API_KEY) openRouter = 'DOWN';
+  const lastDec = database === 'UP' ? await repo.lastDecision() : null;
+  if (!config.OPENROUTER_API_KEY) {
+    openRouter = 'DOWN';
+  } else if (lastDec && typeof lastDec.reason === 'string' && (lastDec.reason.includes('OpenRouter HTTP 401') || lastDec.reason.includes('All OpenRouter fallbacks failed'))) {
+    openRouter = 'DOWN';
+  }
   const operational = database === 'UP' ? await repo.configuration() : defaultTradingConfiguration;
   const at = new Date(); const phase = sessionPhase(at, operational);
   const hb = database === 'UP' ? await repo.lastHeartbeat() : null;
@@ -128,7 +136,15 @@ app.get('/status', async () => {
   const operational = await repo.configuration();
   await repo.ensureAccount(operational.initialBankUsdt);
   const at = new Date(); const price = await broker.price();
-  const [state, performance, daily, reconciliation, pendingOrderCount, dailyResultStatus] = await Promise.all([repo.session(at, operational.timezone), repo.performance(price), repo.dailyResult(sessionDay(at, operational.timezone)), repo.reconciliationState(), repo.pendingOrderCount(), repo.dailyResultStatus(sessionDay(at, operational.timezone))]);
+  const [state, performance, daily, reconciliation, pendingOrderCount, dailyResultStatus, liveErrorCount] = await Promise.all([
+    repo.session(at, operational.timezone),
+    repo.performance(price),
+    repo.dailyResult(sessionDay(at, operational.timezone)),
+    repo.reconciliationState(),
+    repo.pendingOrderCount(),
+    repo.dailyResultStatus(sessionDay(at, operational.timezone)),
+    repo.errorCountForDay(sessionDay(at, operational.timezone), operational.timezone),
+  ]);
   const tradingBlockedReason = reconciliation.status !== 'OK' || !reconciliation.stateConsistent || pendingOrderCount > 0
     ? reconciliation.lastError ?? (pendingOrderCount > 0 ? `${pendingOrderCount} pending order(s) require reconciliation` : `Reconciliation is ${reconciliation.status}`)
     : null;
@@ -141,7 +157,8 @@ app.get('/status', async () => {
     : (state?.initial_equity_usdt !== null && state?.initial_equity_usdt !== undefined
       ? performance.equityUsdt - Number(state.initial_equity_usdt)
       : performance.realizedPnlUsdt + performance.unrealizedPnlUsdt);
-  return { ...performance, loopEnabled: config.TRADING_LOOP_ENABLED, tradingIntervalSeconds: effective.intervalSeconds, timezone: effective.timezone, sessionPhase: state?.phase ?? sessionPhase(at, effective), sessionStartedAt: state?.started_at ?? null, sessionFinishedAt: state?.finished_at ?? null, decisionCyclesToday, operationalChecksToday, forceCloseAttemptsToday: Number(state?.force_close_attempts ?? 0), dailyResultStatus, tradingStartTime: effective.start, stopNewPositionsTime: effective.stopNewPositions, forceCloseTime: effective.forceClose, tradingEndTime: effective.end, configuration, configurationUpdatedAt: operational.updatedAt?.toISOString() ?? null, nextCycleAt: state?.next_cycle_at ?? null, lastCycleAt: state?.last_cycle_at ?? null, cyclesToday: decisionCyclesToday, currentBank: performance.cashUsdt, openPosition: await repo.openPosition(), pnlToday, aiCostToday: daily?.ai_cost_usd ?? 0, tradesToday: daily?.trade_count ?? 0, errorsToday: daily?.error_count ?? 0, lastDecision: await repo.lastDecision(), lastWorkerHeartbeat: await repo.lastHeartbeat(), modelList: config.OPENROUTER_MODELS.split(','), pendingOrderCount, reconciliationStatus: reconciliation.status, lastReconciliationAt: reconciliation.lastReconciliationAt?.toISOString() ?? null, lastReconciliationError: reconciliation.lastError, tradingBlockedReason };
+  const errorsToday = daily?.error_count !== null && daily?.error_count !== undefined ? Number(daily.error_count) : liveErrorCount;
+  return { ...performance, loopEnabled: config.TRADING_LOOP_ENABLED, tradingIntervalSeconds: effective.intervalSeconds, timezone: effective.timezone, sessionPhase: state?.phase ?? sessionPhase(at, effective), sessionStartedAt: state?.started_at ?? null, sessionFinishedAt: state?.finished_at ?? null, decisionCyclesToday, operationalChecksToday, forceCloseAttemptsToday: Number(state?.force_close_attempts ?? 0), dailyResultStatus, tradingStartTime: effective.start, stopNewPositionsTime: effective.stopNewPositions, forceCloseTime: effective.forceClose, tradingEndTime: effective.end, configuration, configurationUpdatedAt: operational.updatedAt?.toISOString() ?? null, nextCycleAt: state?.next_cycle_at ?? null, lastCycleAt: state?.last_cycle_at ?? null, cyclesToday: decisionCyclesToday, currentBank: performance.cashUsdt, openPosition: await repo.openPosition(), pnlToday, aiCostToday: daily?.ai_cost_usd ?? 0, tradesToday: daily?.trade_count ?? 0, errorsToday, lastDecision: await repo.lastDecision(), lastWorkerHeartbeat: await repo.lastHeartbeat(), modelList: config.OPENROUTER_MODELS.split(','), pendingOrderCount, reconciliationStatus: reconciliation.status, lastReconciliationAt: reconciliation.lastReconciliationAt?.toISOString() ?? null, lastReconciliationError: reconciliation.lastError, tradingBlockedReason };
 });
 app.get('/positions',()=>repo.positions());app.get('/trades',async()=> (await repo.trades()).map(tradeResponse));app.get('/decisions',()=>repo.decisions());app.get('/system/events',()=>repo.events());app.get('/performance',async()=>repo.performance(await broker.price()));app.get('/performance/daily',async()=>dailyPerformanceResponse(await repo.dailyResult()));
 app.get('/reports/daily/:date', async (request, reply) => {

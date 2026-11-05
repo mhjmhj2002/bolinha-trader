@@ -1,6 +1,6 @@
-import { config, defaultTradingConfiguration, logger, sessionPhase, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
+import { config, defaultTradingConfiguration, logger, sessionPhase, validateStartupConfiguration, type SessionPhase, type TradingConfiguration } from '@bolinha/core';
 import { TradingRepository } from '@bolinha/database';
-import { createBrokerGateway } from '@bolinha/exchange';
+import { createBrokerGateway, TickEventQueue, B3RealtimeTickServer } from '@bolinha/exchange';
 import { TradingService } from './service.js';
 import { finishDailyIfPositionClosed, isCloseOnlyPhase } from './lifecycle.js';
 import { nextCycleAt, reconciliationRetryDelay } from './scheduler.js';
@@ -8,6 +8,15 @@ import { nextCycleAt, reconciliationRetryDelay } from './scheduler.js';
 const repo = new TradingRepository();
 const exchange = createBrokerGateway(config.SYMBOL);
 const service = new TradingService(repo, exchange);
+export const tickQueue = new TickEventQueue();
+let tickServer: B3RealtimeTickServer | null = null;
+
+// Fast-path: consumidor de ticks em tempo real
+tickQueue.on('tick', (tick) => {
+  void service.onRealtimeTick(tick).catch((err: unknown) => {
+    logger.error({ err, symbol: tick.symbol }, 'Failed to evaluate realtime tick in worker');
+  });
+});
 let stopped = false;
 let timer: NodeJS.Timeout | undefined;
 let startupReconciled = false;
@@ -81,11 +90,29 @@ async function tick() {
   }
 }
 const startupConfiguration = await repo.configuration();
+// Bootstrap validation: a blank OPENROUTER_API_KEY must be loud (every decision
+// would silently be HOLD) but never fatal — the worker still runs and reports health.
+validateStartupConfiguration(config, logger);
 await repo.ensureAccount(startupConfiguration.initialBankUsdt); await repo.heartbeat();
 await repo.event('INFO', 'worker_started', 'Worker started', { loopEnabled: config.TRADING_LOOP_ENABLED });
 setInterval(() => { void repo.heartbeat().catch((error: unknown) => logger.error({ err: error }, 'Heartbeat failure')); }, 30_000);
 if (!config.TRADING_LOOP_ENABLED) logger.info({ event: 'worker_idle', loopEnabled: false }, 'Worker started with loop disabled');
 else logger.warn({ event: 'worker_loop_started', intervalSeconds: startupConfiguration.intervalSeconds }, 'Worker loop enabled');
+if (config.WS_ENABLED) {
+  tickServer = new B3RealtimeTickServer(tickQueue, { host: config.WS_HOST, port: config.WS_PORT, path: config.WS_PATH });
+  await tickServer.start().catch((err: unknown) => {
+    logger.error({ err }, 'Failed to start B3RealtimeTickServer');
+  });
+}
 void tick();
-const stop = async () => { stopped = true; if (timer) clearTimeout(timer); try { await repo.event('INFO', 'worker_stopped', 'Worker stopped'); } catch (error) { logger.error({ err: error }, 'Could not persist worker_stopped event'); } logger.info({ event: 'shutdown' }, 'Worker shutdown'); process.exit(0); };
+const stop = async () => {
+  stopped = true;
+  if (timer) clearTimeout(timer);
+  if (tickServer) await tickServer.stop().catch(() => {});
+  tickQueue.close();
+  try { await repo.event('INFO', 'worker_stopped', 'Worker stopped'); } catch (error) { logger.error({ err: error }, 'Could not persist worker_stopped event'); }
+  logger.info({ event: 'shutdown' }, 'Worker shutdown');
+  process.exit(0);
+};
 process.on('SIGINT', stop); process.on('SIGTERM', stop);
+

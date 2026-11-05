@@ -7,17 +7,17 @@ afterEach(() => vi.useRealTimers());
 describe('one trading cycle', () => {
   it('persists a mocked HOLD and its operational events without submitting an order', async () => {
     const saved: { snapshot: boolean; decision: boolean; events: string[] } = { snapshot: false, decision: false, events: [] };
-    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => null, pendingOrder: async () => false, saveSnapshot: async () => { saved.snapshot = true; return 1; }, saveDecision: async () => { saved.decision = true; return 1; }, event: async (_severity: string, type: string) => { saved.events.push(type); } };
+    const repo = { ensureAccount: async () => { }, heartbeat: async () => { }, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => null, pendingOrder: async () => false, saveSnapshot: async () => { saved.snapshot = true; return 1; }, saveDecision: async () => { saved.decision = true; return 1; }, event: async (_severity: string, type: string) => { saved.events.push(type); } };
     const exchange = { candles: async () => candles, rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), placeMarketOrder: async () => { throw new Error('must not submit'); }, orderByClientId: async () => null };
     const ai = { decide: async () => ({ decision: { action: 'HOLD' as const, amountUsdt: 0, confidence: 1, reason: 'mock hold', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
-    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T12:00:00Z'));
-    expect(result.action).toBe('HOLD'); expect(saved.snapshot).toBe(true); expect(saved.decision).toBe(true); expect(saved.events).toEqual(['cycle_started', 'decision_created', 'cycle_completed']);
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T13:00:00Z'));
+    expect(result.action).toBe('HOLD'); expect(saved.snapshot).toBe(true); expect(saved.decision).toBe(true); expect(saved.events).toEqual(['cycle_started', 'robots_pre_analysis_completed', 'ai_cycle_bypassed', 'decision_created', 'cycle_completed']);
   });
 
   it('force close is idempotent and sells only the persisted conceptual position', async () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .001, entryPrice: 10_000, costUsdt: 10, openedAt: new Date() };
     let submitted = 0;
-    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, openPosition: async () => position, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => { position = null; } };
+    const repo = { ensureAccount: async () => { }, heartbeat: async () => { }, event: async () => { }, openPosition: async () => position, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => { }, recordExecution: async () => { position = null; } };
     const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async () => { submitted++; return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: .001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
     const service = new TradingService(repo as never, exchange as never, {} as never);
     await service.runOnce(new Date('2026-10-01T20:59:00Z'));
@@ -30,10 +30,10 @@ describe('one trading cycle', () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .0015, entryPrice: 9_800, costUsdt: 14.7, openedAt: new Date() };
     const sent: number[] = [];
     const recorded: number[] = [];
-    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 5, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => false, saveSnapshot: async () => 1, saveDecision: async () => 1, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async (order: { quantity: number }) => { recorded.push(order.quantity); position = null; } };
+    const repo = { ensureAccount: async () => { }, heartbeat: async () => { }, event: async () => { }, account: async () => ({ initialBankUsdt: 20, cashUsdt: 5, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => false, saveSnapshot: async () => 1, saveDecision: async () => 1, createPendingOrder: async () => 1, markOrderRejected: async () => { }, recordExecution: async (order: { quantity: number }) => { recorded.push(order.quantity); position = null; } };
     const exchange = { candles: async () => candles.map((c) => ({ ...c, open: 10_000, high: 10_001, low: 9_999, close: 10_000 })), rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), placeMarketOrder: async (_side: string, quantity: number) => { sent.push(quantity); return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: quantity, cummulativeQuoteQty: quantity * 10_000, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
     const ai = { decide: async () => ({ decision: { action: 'SELL' as const, amountUsdt: 1, confidence: 1, reason: 'sell only one USDT', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
-    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T12:00:00Z'));
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T13:00:00Z'));
     expect(result.action).toBe('SELL');
     expect(sent).toEqual([.0015]);
     expect(recorded).toEqual(sent);
@@ -44,11 +44,11 @@ describe('one trading cycle', () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .0015, entryPrice: 9_800, costUsdt: 14.7, openedAt: new Date() };
     const snapshots: Array<{ price: number; at: Date }> = [];
     const repo = {
-      ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {},
+      ensureAccount: async () => { }, heartbeat: async () => { }, event: async () => { },
       account: async () => ({ initialBankUsdt: 20, cashUsdt: 5, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => position, pendingOrder: async () => false,
       saveSnapshot: async () => 1, saveDecision: async () => 1, createPendingOrder: async () => 1,
-      markOrderRejected: async () => {},
+      markOrderRejected: async () => { },
       saveAccountSnapshot: async (price: number, at: Date) => { snapshots.push({ price, at }); },
       recordExecution: async () => { position = null; },
     };
@@ -62,7 +62,7 @@ describe('one trading cycle', () => {
     };
     const ai = { decide: async () => ({ decision: { action: 'SELL' as const, amountUsdt: 15, confidence: 1, reason: 'take profit', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
 
-    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T12:00:00Z'));
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T13:00:00Z'));
 
     expect(result.action).toBe('SELL');
     expect(position).toBeNull();
@@ -78,11 +78,11 @@ describe('one trading cycle', () => {
     const snapshots: Array<{ price: number; at: Date }> = [];
     const events: string[] = [];
     const repo = {
-      ensureAccount: async () => {}, heartbeat: async () => {},
+      ensureAccount: async () => { }, heartbeat: async () => { },
       event: async (_severity: string, type: string) => { events.push(type); },
       account: async () => ({ initialBankUsdt: 100, cashUsdt: 10.24, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => position, pendingOrder: async () => false, createPendingOrder: async () => 1,
-      markOrderRejected: async () => {},
+      markOrderRejected: async () => { },
       saveAccountSnapshot: async (price: number, at: Date) => { snapshots.push({ price, at }); },
       recordExecution: async () => { position = null; },
     };
@@ -108,11 +108,11 @@ describe('one trading cycle', () => {
     let snapshotAttempts = 0;
     const events: string[] = [];
     const repo = {
-      ensureAccount: async () => {}, heartbeat: async () => {},
+      ensureAccount: async () => { }, heartbeat: async () => { },
       event: async (_severity: string, type: string) => { events.push(type); },
       account: async () => ({ initialBankUsdt: 100, cashUsdt: 10.24, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => position, pendingOrder: async () => false, createPendingOrder: async () => 1,
-      markOrderRejected: async () => {},
+      markOrderRejected: async () => { },
       saveAccountSnapshot: async () => { snapshotAttempts++; throw new Error('dashboard writer unavailable'); },
       recordExecution: async () => { position = null; },
     };
@@ -138,7 +138,7 @@ describe('one trading cycle', () => {
     let pending: { id: number; clientOrderId: string; side: 'SELL'; requestedAmount: number; requestedQuantity: number } | null = null;
     const clientIds: string[] = [];
     let attempts = 0;
-    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => Boolean(pending), pendingOrderDetails: async () => pending, createPendingOrder: async (clientOrderId: string, side: 'SELL', amount: number, quantity: number) => { pending = { id: 1, clientOrderId, side, requestedAmount: amount, requestedQuantity: quantity }; return 1; }, markOrderRejected: async () => {}, recordExecution: async () => { position = null; pending = null; } };
+    const repo = { ensureAccount: async () => { }, heartbeat: async () => { }, event: async () => { }, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => Boolean(pending), pendingOrderDetails: async () => pending, createPendingOrder: async (clientOrderId: string, side: 'SELL', amount: number, quantity: number) => { pending = { id: 1, clientOrderId, side, requestedAmount: amount, requestedQuantity: quantity }; return 1; }, markOrderRejected: async () => { }, recordExecution: async () => { position = null; pending = null; } };
     const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async (_side: string, quantity: number, clientOrderId: string) => { clientIds.push(clientOrderId); attempts++; if (attempts === 1) throw new Error('temporary B3 outage'); return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: quantity, cummulativeQuoteQty: quantity * 10_000, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
     const service = new TradingService(repo as never, exchange as never, {} as never);
     await expect(service.runOnce(new Date('2026-10-01T20:59:00Z'))).rejects.toThrow('temporary B3 outage');
@@ -152,23 +152,23 @@ describe('one trading cycle', () => {
   it('at 18:10 after restart, an open position is still closed instead of being treated as FINISHED', async () => {
     let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date } | null = { id: 1, quantity: .001, entryPrice: 10_000, costUsdt: 10, openedAt: new Date() };
     let submitted = 0;
-    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => { position = null; } };
+    const repo = { ensureAccount: async () => { }, heartbeat: async () => { }, event: async () => { }, account: async () => ({ initialBankUsdt: 20, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => position, pendingOrder: async () => false, createPendingOrder: async () => 1, markOrderRejected: async () => { }, recordExecution: async () => { position = null; } };
     const exchange = { rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), price: async () => 10_000, placeMarketOrder: async () => { submitted++; return { orderId: 'one', status: 'FILLED', side: 'SELL' as const, executedQty: .001, cummulativeQuoteQty: 10, commission: 0, transactTime: new Date() }; }, orderByClientId: async () => null };
     await new TradingService(repo as never, exchange as never, {} as never).runOnce(new Date('2026-10-01T21:10:00Z'));
     expect(submitted).toBe(1);
     expect(position).toBeNull();
   });
 
-  it('turns a BUY into HOLD when analysis crosses the 17:50 cutoff before submission', async () => {
+  it('turns a BUY into HOLD when analysis crosses the 16:45 cutoff before submission', async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-10-01T20:50:01Z'));
+    vi.setSystemTime(new Date('2026-10-01T19:45:01Z'));
     let submitted = 0;
     const savedActions: string[] = [];
-    const repo = { ensureAccount: async () => {}, heartbeat: async () => {}, event: async () => {}, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => null, pendingOrder: async () => false, saveSnapshot: async () => 1, saveDecision: async (_decision: unknown, _usage: unknown, action: string) => { savedActions.push(action); return 1; }, createPendingOrder: async () => 1, markOrderRejected: async () => {}, recordExecution: async () => {} };
+    const repo = { ensureAccount: async () => { }, heartbeat: async () => { }, event: async () => { }, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), openPosition: async () => null, pendingOrder: async () => false, saveSnapshot: async () => 1, saveDecision: async (_decision: unknown, _usage: unknown, action: string) => { savedActions.push(action); return 1; }, createPendingOrder: async () => 1, markOrderRejected: async () => { }, recordExecution: async () => { } };
     const exchange = { candles: async () => candles.map((c) => ({ ...c, open: 10_000, high: 10_001, low: 9_999, close: 10_000 })), rules: async () => ({ minNotional: 10, minQty: .0001, stepSize: .0001 }), placeMarketOrder: async () => { submitted++; throw new Error('must not submit after cutoff'); }, orderByClientId: async () => null };
     const ai = { decide: async () => ({ decision: { action: 'BUY' as const, amountUsdt: 10, confidence: 1, reason: 'buy', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
 
-    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T20:49:59Z'));
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T19:44:59Z'));
     expect(result.action).toBe('HOLD');
     expect(savedActions).toEqual(['HOLD']);
     expect(submitted).toBe(0);
@@ -182,8 +182,8 @@ describe('one trading cycle', () => {
     const savedReasons: Array<string | null> = [];
     let submitted = 0;
     const repo = {
-      ensureAccount: async () => {},
-      heartbeat: async () => {},
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
       event: async (_severity: string, type: string, _message: string, metadata?: unknown) => { events.push({ type, metadata }); },
       account: async () => ({ initialBankUsdt: 100, cashUsdt: 100, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => null,
@@ -191,8 +191,8 @@ describe('one trading cycle', () => {
       saveSnapshot: async () => 1,
       saveDecision: async (_decision: unknown, _usage: unknown, action: string, _amount: number, reason: string | null) => { savedActions.push(action); savedReasons.push(reason); return 1; },
       createPendingOrder: async () => 1,
-      markOrderRejected: async () => {},
-      recordExecution: async () => {},
+      markOrderRejected: async () => { },
+      recordExecution: async () => { },
     };
     // Série em queda nos três timeframes: EMA9 < EMA21 => sem confluência de alta.
     const fallingCloses = [30];
@@ -207,7 +207,7 @@ describe('one trading cycle', () => {
     };
     const ai = { decide: async () => ({ decision: { action: 'BUY' as const, amountUsdt: 100, confidence: 0.9, reason: 'ai wants to buy the top', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
 
-    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T12:00:00Z'));
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T13:00:00Z'));
 
     expect(result.action).toBe('HOLD');
     expect(savedActions).toEqual(['HOLD']);
@@ -219,17 +219,17 @@ describe('one trading cycle', () => {
   it('holds without submitting when a timeframe has insufficient candles for the entry filter', async () => {
     let submitted = 0;
     const repo = {
-      ensureAccount: async () => {},
-      heartbeat: async () => {},
-      event: async () => {},
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
+      event: async () => { },
       account: async () => ({ initialBankUsdt: 100, cashUsdt: 100, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => null,
       pendingOrder: async () => false,
       saveSnapshot: async () => 1,
       saveDecision: async () => 1,
       createPendingOrder: async () => 1,
-      markOrderRejected: async () => {},
-      recordExecution: async () => {},
+      markOrderRejected: async () => { },
+      recordExecution: async () => { },
     };
     // 5m com apenas 5 candles: indicadores impossíveis => fail-closed.
     const exchange = {
@@ -240,14 +240,15 @@ describe('one trading cycle', () => {
     };
     const ai = { decide: async () => ({ decision: { action: 'BUY' as const, amountUsdt: 100, confidence: 0.9, reason: 'buy on incomplete data', rawResponse: null }, usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, latencyMs: 1, error: null, fallbackUsed: false } }) };
 
-    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T12:00:00Z'));
+    const result = await new TradingService(repo as never, exchange as never, ai as never).runOnce(new Date('2026-10-01T13:00:00Z'));
 
     expect(result.action).toBe('HOLD');
     expect(submitted).toBe(0);
   });
 
-  it('records a force-close without a position as a NOOP, not as a forced close', async () => {    const events: string[] = [];
-    const repo = { ensureAccount: async () => {}, event: async (_severity: string, type: string) => { events.push(type); }, openPosition: async () => null, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false };
+  it('records a force-close without a position as a NOOP, not as a forced close', async () => {
+    const events: string[] = [];
+    const repo = { ensureAccount: async () => { }, event: async (_severity: string, type: string) => { events.push(type); }, openPosition: async () => null, account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }), pendingOrder: async () => false };
     const result = await new TradingService(repo as never, {} as never, {} as never).forceClosePosition();
     expect(result).toMatchObject({ action: 'HOLD', reason: 'No open conceptual position' });
     expect(events).toEqual(['force_close_noop']);
@@ -259,8 +260,8 @@ describe('one trading cycle', () => {
     let rejectedReason = '';
     const events: string[] = [];
     const repo = {
-      ensureAccount: async () => {},
-      heartbeat: async () => {},
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
       event: async (_severity: string, type: string) => { events.push(type); },
       account: async () => ({ initialBankUsdt: 20, cashUsdt: 0.1, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => position,
@@ -300,8 +301,8 @@ describe('one trading cycle', () => {
     let rejectedReason = '';
     const events: string[] = [];
     const repo = {
-      ensureAccount: async () => {},
-      heartbeat: async () => {},
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
       event: async (_severity: string, type: string) => { events.push(type); },
       account: async () => ({ initialBankUsdt: 20, cashUsdt: 0.1, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => position,
@@ -339,8 +340,8 @@ describe('one trading cycle', () => {
     const events: string[] = [];
     let stateConsistent = false;
     const repo = {
-      ensureAccount: async () => {},
-      heartbeat: async () => {},
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
       event: async (_severity: string, type: string) => { events.push(type); },
       account: async () => ({ initialBankUsdt: 20, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => null,
@@ -348,9 +349,9 @@ describe('one trading cycle', () => {
       pendingOrders: async () => pendingOrdersList,
       pendingOrderCount: async () => pendingOrdersList.length,
       reconciliationState: async () => ({ status: 'OK' as const, stateConsistent: pendingOrdersList.length === 0, lastError: null }),
-      reconciliationStarted: async () => {},
+      reconciliationStarted: async () => { },
       reconciliationCompleted: async () => { stateConsistent = true; },
-      reconciliationFailed: async () => {},
+      reconciliationFailed: async () => { },
       stateConsistency: async () => ({ consistent: pendingOrdersList.length === 0, reason: null }),
       saveSnapshot: async () => 1,
       saveDecision: async () => 1,
@@ -394,8 +395,8 @@ describe('one trading cycle', () => {
     const position = { id: 1, ticker: 'PETR4', quantity: 3, entryPrice: 30.0, costUsdt: 90.0, openedAt: new Date() };
 
     const repo = {
-      ensureAccount: async () => {},
-      heartbeat: async () => {},
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
       account: async () => ({ initialBankUsdt: 100, cashUsdt: 10, realizedPnlUsdt: 0, aiCostUsd: 0 }),
       openPosition: async () => position,
       pendingOrder: async () => false,
@@ -438,5 +439,191 @@ describe('one trading cycle', () => {
     expect(savedDecisionAction).toBe('HOLD');
     expect(orderPlaced).toBe(false);
     expect(events.some(e => e.type === 'decision_rejected_by_risk' && String(e.metadata?.brokerPrice) === '29.8')).toBe(true);
+  });
+
+  it('triggers mechanical partial take profit when position has 4 shares and price is +1.0% above entry, selling 2 shares and continuing with remainder', async () => {
+    // Posição com 4 ações de PETR4 a R$ 30.00
+    let position: { id: number; quantity: number; entryPrice: number; costUsdt: number; openedAt: Date; symbol: string } | null = {
+      id: 1,
+      quantity: 4,
+      entryPrice: 30.0,
+      costUsdt: 120.0,
+      openedAt: new Date(),
+      symbol: 'PETR4',
+    };
+    const executedOrders: Array<{ side: string; quantity: number; price: number }> = [];
+    const events: Array<{ type: string; metadata?: any }> = [];
+
+    const repo = {
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
+      account: async () => ({ initialBankUsdt: 100, cashUsdt: 20, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => position,
+      pendingOrder: async () => false,
+      saveSnapshot: async () => 1,
+      saveDecision: async () => 1,
+      createPendingOrder: async () => 1,
+      markOrderRejected: async () => { },
+      saveAccountSnapshot: async () => { },
+      event: async (_sev: string, type: string, _msg: string, metadata?: any) => {
+        events.push({ type, metadata });
+      },
+      recordExecution: async (order: { quantity: number; quote: number; side: 'BUY' | 'SELL' }) => {
+        if (position && order.side === 'SELL') {
+          position = {
+            ...position,
+            quantity: position.quantity - order.quantity,
+            costUsdt: position.costUsdt - (position.costUsdt * (order.quantity / position.quantity)),
+          };
+        }
+        return { applied: true };
+      },
+    };
+
+    // Preço atual a R$ 30.30 (+1.00% em relação a R$ 30.00)
+    const candles3030 = candles.map((c) => ({ ...c, close: 30.30, open: 30.29, high: 30.31, low: 30.28 }));
+    const exchange = {
+      candles: async () => candles3030,
+      rules: async () => ({ minNotional: 1, minQty: 1, stepSize: 1 }),
+      price: async () => 30.30,
+      placeMarketOrder: async (side: string, quantity: number) => {
+        executedOrders.push({ side, quantity, price: 30.30 });
+        return {
+          orderId: 'partial-order-1',
+          status: 'FILLED',
+          side: 'SELL' as const,
+          executedQty: quantity,
+          cummulativeQuoteQty: quantity * 30.30,
+          commission: 0,
+          transactTime: new Date(),
+        };
+      },
+      orderByClientId: async () => null,
+    };
+
+    // A IA hesita e pede HOLD
+    const ai = {
+      decide: async () => ({
+        decision: { action: 'HOLD' as const, amountUsdt: 0, confidence: 0.8, reason: 'AI hesitates and wants to wait', rawResponse: null },
+        usage: { modelRequested: 'test', latencyMs: 10, promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0, error: null, fallbackUsed: false },
+      }),
+    };
+
+    const service = new TradingService(repo as never, exchange as never, ai as never);
+
+    // Ciclo 1: Aciona saída parcial mecânica automática vendendo 50% (2 ações)
+    const result1 = await service.runOnce(new Date('2026-10-01T12:00:00Z'));
+    expect(result1.action).toBe('SELL');
+    expect(executedOrders).toHaveLength(1);
+    expect(executedOrders[0].quantity).toBe(2);
+    expect(position).not.toBeNull();
+    expect(position!.quantity).toBe(2);
+    expect(position!.entryPrice).toBe(30.0);
+
+    // Ciclo 2: No próximo ciclo com preço ainda em R$ 30.30, não deve re-executar a parcial
+    const result2 = await service.runOnce(new Date('2026-10-01T12:03:00Z'));
+    expect(result2.action).toBe('HOLD');
+    expect(executedOrders).toHaveLength(1);
+    expect(position!.quantity).toBe(2);
+  });
+
+  it('bypasses AI call and generates zero cost when robots pre-analysis detects no opportunities', async () => {
+    let aiCalls = 0;
+    const events: string[] = [];
+    const savedDecisions: any[] = [];
+    const repo = {
+      ensureAccount: async () => { },
+      heartbeat: async () => { },
+      account: async () => ({ initialBankUsdt: 100, cashUsdt: 100, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => null,
+      pendingOrder: async () => false,
+      saveSnapshot: async () => 1,
+      saveDecision: async (dec: any, usage: any) => { savedDecisions.push({ dec, usage }); return 1; },
+      event: async (_sev: string, type: string) => { events.push(type); },
+    };
+
+    // Candles flat/neutros (sem confluência de alta, EMA mistas, RSI neutro)
+    const neutralCandles = Array.from({ length: 30 }, (_, i): Candle => ({
+      openTime: i * 60000,
+      closeTime: (i + 1) * 60000 - 1,
+      open: 30.0,
+      high: 30.05,
+      low: 29.95,
+      close: 30.0,
+      volume: 50,
+    }));
+
+    const exchange = {
+      candles: async () => neutralCandles,
+      rules: async () => ({ minNotional: 10, minQty: 1, stepSize: 1 }),
+      price: async () => 30.0,
+      orderByClientId: async () => null,
+    };
+
+    const ai = {
+      decide: async () => {
+        aiCalls++;
+        return {
+          decision: { action: 'HOLD' as const, amountUsdt: 0, confidence: 1, reason: 'should not be called', rawResponse: null },
+          usage: { modelRequested: 'mock', modelReturned: 'mock', promptTokens: 100, completionTokens: 50, totalTokens: 150, costUsd: 0.005, latencyMs: 500, error: null, fallbackUsed: false },
+        };
+      },
+    };
+
+    const service = new TradingService(repo as never, exchange as never, ai as never);
+    const result = await service.runOnce(new Date('2026-10-01T12:00:00Z'));
+
+    expect(result.action).toBe('HOLD');
+    expect(aiCalls).toBe(0); // A IA foi completamente poupada
+    expect(events).toContain('ai_cycle_bypassed');
+    expect(savedDecisions).toHaveLength(1);
+    expect(savedDecisions[0].usage.costUsd).toBe(0);
+    expect(savedDecisions[0].usage.modelRequested).toBe('deterministic_robots');
+  });
+
+  it('reconcileStateOnStartup synchronizes open position with exchange gateway', async () => {
+    let syncedPosition: { ticker: string; quantity: number; entryPrice: number; costBrl: number } | null = null;
+    let syncedTicker: string | null = null;
+    const openPos = {
+      id: 1,
+      quantity: 3,
+      entryPrice: 30.099,
+      costUsdt: 90.297,
+      openedAt: new Date(),
+      symbol: 'PETR4',
+    };
+
+    const repo = {
+      ensureAccount: async () => { },
+      account: async () => ({ initialBankUsdt: 100, cashUsdt: 9.7, realizedPnlUsdt: 0, aiCostUsd: 0 }),
+      openPosition: async () => openPos,
+      pendingOrders: async () => [],
+      reconciliationStarted: async () => { },
+      reconciliationCompleted: async () => { },
+      reconciliationFailed: async () => { },
+      stateConsistency: async () => ({ consistent: true, reason: null }),
+      event: async () => { },
+    };
+
+    const exchange = {
+      orderByClientId: async () => null,
+      syncPosition: (pos: { ticker: string; quantity: number; entryPrice: number; costBrl: number } | null) => {
+        syncedPosition = pos;
+      },
+      setTicker: (ticker: string) => {
+        syncedTicker = ticker;
+      },
+    };
+
+    const service = new TradingService(repo as never, exchange as never, {} as never);
+    await service.reconcileStateOnStartup();
+
+    expect(syncedPosition).toEqual({
+      ticker: 'PETR4',
+      quantity: 3,
+      entryPrice: 30.099,
+      costBrl: 90.297,
+    });
+    expect(syncedTicker).toBe('PETR4');
   });
 });

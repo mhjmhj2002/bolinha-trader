@@ -4,7 +4,19 @@ import type { BrokerGateway } from '@bolinha/exchange';
 type DailyRepository = {
   openPosition(): Promise<unknown | null>;
   dailyResult(): Promise<unknown | null>;
-  createDailyResult(price: number, at: Date): Promise<{ session_day?: unknown } | null>;
+  createDailyResult(price: number, at: Date): Promise<{
+    session_day?: unknown;
+    gross_return_pct?: unknown;
+    net_return_pct?: unknown;
+    position_count?: unknown;
+    win_count?: unknown;
+    loss_count?: unknown;
+    profit_factor?: unknown;
+    expectancy_usdt?: unknown;
+    fees_pct_of_gross?: unknown;
+    ai_call_count?: unknown;
+    bypass_count?: unknown;
+  } | null>;
   event(level: string, event: string, message: string, payload?: unknown): Promise<unknown>;
   eventOnceForSession?: (level: string, event: string, message: string, at: Date, payload?: unknown) => Promise<boolean>;
   markDailyResultPending?: (at: Date) => Promise<void>;
@@ -42,7 +54,19 @@ export async function finishDailyIfPositionClosed(
     // explicit call makes the pending marker impossible to survive here, even
     // for reduced repositories.
     await repo.markDailyResultOk?.(at);
-    await emit('INFO', 'daily_result_created', 'Daily result persisted', { sessionDay: result.session_day });
+    await emit('INFO', 'daily_result_created', `Daily result persisted: gross=${result.gross_return_pct}% net=${result.net_return_pct}% winRate=${result.win_count}/${result.position_count} profitFactor=${result.profit_factor ?? 'N/A'} exp=${result.expectancy_usdt}R$`, {
+      sessionDay: result.session_day,
+      grossReturnPct: result.gross_return_pct,
+      netReturnPct: result.net_return_pct,
+      positionCount: result.position_count,
+      winCount: result.win_count,
+      lossCount: result.loss_count,
+      profitFactor: result.profit_factor,
+      expectancyUsdt: result.expectancy_usdt,
+      feesPctOfGross: result.fees_pct_of_gross,
+      aiCallCount: result.ai_call_count,
+      bypassCount: result.bypass_count,
+    });
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown daily result failure';

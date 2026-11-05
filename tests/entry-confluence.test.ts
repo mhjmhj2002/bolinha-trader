@@ -46,10 +46,12 @@ const indicator = (overrides: Partial<IndicatorSet>): IndicatorSet => ({
 const timeframes = ['1m', '5m', '15m'] as const;
 const strictOptions = { timeframes: [...timeframes], minConfluentTimeframes: 3, rsiOverboughtThreshold: 70 };
 
+const lastBullishClose = bullishCandles().at(-1)!.close;
+
 const baseRisk: Omit<B3RiskInput, 'entryConfluence'> = {
   action: 'BUY',
   requestedBrl: 100,
-  price: 10,
+  price: lastBullishClose,
   account: { initialBankBrl: 100, cashBrl: 100, realizedPnlBrl: 0 },
   position: null,
   rules: { minNotional: 1, minQty: 1, stepSize: 1 },
@@ -177,6 +179,22 @@ describe('multi-timeframe entry confluence', () => {
     expect(confluence.allowed).toBe(false);
   });
 
+  it('allows the BUY when 2 of 3 timeframes are confluent with minConfluentTimeframes=2', () => {
+    const confluence = evaluateCandlesEntryConfluence(
+      { '1m': bullishCandles(), '5m': bearishCandles(), '15m': bullishCandles() },
+      { timeframes: [...timeframes], minConfluentTimeframes: 2, rsiOverboughtThreshold: 70 },
+    );
+    expect(confluence.valid).toBe(true);
+    expect(confluence.allowed).toBe(true);
+    expect(confluence.confluentCount).toBe(2);
+    expect(confluence.requiredCount).toBe(2);
+    expect(confluence.confluentTimeframes).toEqual(['1m', '15m']);
+
+    const risk = applyB3Risk({ ...baseRisk, entryConfluence: confluence });
+    expect(risk.action).toBe('BUY');
+    expect(risk.rejectionReason).toBeNull();
+  });
+
   it('keeps SELL/HOLD decisions untouched by the entry filter', () => {
     const blocked = evaluateCandlesEntryConfluence(
       { '1m': bearishCandles(), '5m': bearishCandles(), '15m': bearishCandles() },
@@ -189,5 +207,142 @@ describe('multi-timeframe entry confluence', () => {
     });
     expect(risk.action).toBe('HOLD');
     expect(risk.rejectionReason).toBe('AI requested HOLD');
+  });
+
+  describe('VWAP institutional filter', () => {
+    it('allows BUY when price >= VWAP', () => {
+      // 1m candles com VWAP ~ 10.00 e último preço 10.50
+      const candles: Candle[] = [
+        { openTime: 1, closeTime: 1, open: 10, high: 10, low: 10, close: 10, volume: 100 },
+        { openTime: 2, closeTime: 2, open: 10, high: 11, low: 10, close: 10.5, volume: 100 },
+      ];
+      const confluence = evaluateEntryConfluence(
+        {
+          '1m': { ...indicator({ price: 10.5 }), vwap: 10.12 },
+          '5m': indicator({ price: 10.5 }),
+          '15m': indicator({ price: 10.5 }),
+        },
+        {
+          timeframes: ['1m', '5m', '15m'],
+          requireVwapAbove: true,
+          vwap: 10.12,
+          currentPrice: 10.5,
+        },
+      );
+      expect(confluence.allowed).toBe(true);
+      expect(confluence.vwapAcceptable).toBe(true);
+
+      const risk = applyB3Risk({
+        ...baseRisk,
+        price: 10.5,
+        vwap: 10.12,
+        entryConfluence: confluence,
+      });
+      expect(risk.action).toBe('BUY');
+    });
+
+    it('rejects BUY to HOLD when price < VWAP with standard rejection reason', () => {
+      const confluence = evaluateEntryConfluence(
+        {
+          '1m': { ...indicator({ price: 9.8 }), vwap: 10.5 },
+          '5m': indicator({ price: 9.8 }),
+          '15m': indicator({ price: 9.8 }),
+        },
+        {
+          timeframes: ['1m', '5m', '15m'],
+          requireVwapAbove: true,
+          vwap: 10.5,
+          currentPrice: 9.8,
+        },
+      );
+      expect(confluence.allowed).toBe(false);
+      expect(confluence.vwapAcceptable).toBe(false);
+      expect(confluence.reason).toContain('BUY rejected: Price R$ 9.80 is below daily VWAP R$ 10.50');
+
+      const risk = applyB3Risk({
+        ...baseRisk,
+        price: 9.8,
+        vwap: 10.5,
+        entryConfluence: confluence,
+      });
+      expect(risk.action).toBe('HOLD');
+      expect(risk.amountBrl).toBe(0);
+      expect(risk.rejectionReason).toBe('BUY rejected: Price R$ 9.80 is below daily VWAP R$ 10.50');
+    });
+
+    it('rejects BUY directly in applyB3Risk if price < vwap even without confluence error', () => {
+      const risk = applyB3Risk({
+        ...baseRisk,
+        price: 25.0,
+        vwap: 25.5,
+        requireVwapAbove: true,
+      });
+      expect(risk.action).toBe('HOLD');
+      expect(risk.rejectionReason).toBe('BUY rejected: Price R$ 25.00 is below daily VWAP R$ 25.50');
+    });
+
+    it('allows BUY when requireVwapAbove is false even if price < vwap', () => {
+      const risk = applyB3Risk({
+        ...baseRisk,
+        price: 25.0,
+        vwap: 25.5,
+        requireVwapAbove: false,
+        requireEntryConfluence: false,
+      });
+      expect(risk.action).toBe('BUY');
+      expect(risk.rejectionReason).toBeNull();
+    });
+
+    it('TASK-37: blocks BUY when RSI is oversold / falling knife (rsiOversoldThreshold)', () => {
+      const confluence = evaluateEntryConfluence(
+        {
+          '1m': indicator({ rsi14: 28, ema9: 30, ema21: 29 }), // RSI < 35
+          '5m': indicator({ rsi14: 55, ema9: 30, ema21: 29 }),
+          '15m': indicator({ rsi14: 55, ema9: 30, ema21: 29 }),
+        },
+        {
+          timeframes: ['1m', '5m', '15m'],
+          minConfluentTimeframes: 3,
+          rsiOversoldThreshold: 35,
+        },
+      );
+      expect(confluence.allowed).toBe(false);
+      expect(confluence.reason).toContain('falling knife');
+    });
+
+    it('TASK-37: blocks BUY when price is overextended above VWAP (maxVwapDistancePct)', () => {
+      const confluence = evaluateEntryConfluence(
+        {
+          '1m': indicator({ price: 31.0, ema9: 30, ema21: 29, rsi14: 55 }),
+          '5m': indicator({ price: 31.0, ema9: 30, ema21: 29, rsi14: 55 }),
+          '15m': indicator({ price: 31.0, ema9: 30, ema21: 29, rsi14: 55 }),
+        },
+        {
+          timeframes: ['1m', '5m', '15m'],
+          currentPrice: 31.0,
+          vwap: 30.0, // Preço 3.33% acima da VWAP
+          maxVwapDistancePct: 0.02, // Limite de 2%
+        },
+      );
+      expect(confluence.allowed).toBe(false);
+      expect(confluence.reason).toContain('is overextended (3.33% > max 2.00%) above VWAP');
+    });
+
+    it('TASK-37: blocks BUY when price is overextended above EMA21 (maxEmaDistancePct)', () => {
+      const confluence = evaluateEntryConfluence(
+        {
+          '1m': indicator({ price: 31.0, ema9: 30, ema21: 29.5, rsi14: 55 }), // ~5% acima de 29.5
+          '5m': indicator({ price: 31.0, ema9: 30, ema21: 29.5, rsi14: 55 }),
+          '15m': indicator({ price: 31.0, ema9: 30, ema21: 29.5, rsi14: 55 }),
+        },
+        {
+          timeframes: ['1m', '5m', '15m'],
+          minConfluentTimeframes: 3,
+          maxEmaDistancePct: 0.03, // Limite de 3%
+        },
+      );
+      expect(confluence.allowed).toBe(false);
+      expect(confluence.reason).toContain('Price extended 5.08% above EMA21');
+    });
   });
 });

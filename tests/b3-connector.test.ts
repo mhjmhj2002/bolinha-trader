@@ -106,7 +106,9 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       expect(applyB3Risk({ ...base, price: 1, requestedBrl: 1 }).quantity).toBe(1);
       expect(applyB3Risk({ ...base, requestedBrl: 10 }).quantity).toBe(1);
       expect(applyB3Risk({ ...base, requestedBrl: 37 }).quantity).toBe(3);
-      expect(applyB3Risk({ ...base, requestedBrl: 999 }).quantity).toBe(10);
+      // TASK-16: 10 ações custariam R$ 100,03 no broker (slippage + emolumentos), acima do
+      // caixa de R$ 100,00. O dimensionamento cost-aware fica em 9 ações executáveis.
+      expect(applyB3Risk({ ...base, requestedBrl: 999 }).quantity).toBe(9);
     });
 
     it('rejects BUY with HOLD when cash is strictly insufficient for 1 share', () => {
@@ -121,7 +123,9 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       const bank = { initialBankBrl: 100, cashBrl: 60, realizedPnlBrl: 0 };
       const position = { ticker: 'PETR4', quantity: 4, entryPrice: 10, costBrl: 40 };
       const buy = applyB3Risk({ action: 'BUY', requestedBrl: 60, price: 10, account: bank, position, rules: b3Rules, maxPositionPercent: 100, duplicateOrderPending: false });
-      expect(buy).toMatchObject({ action: 'BUY', quantity: 6 });
+      // TASK-16: 6 ações custariam R$ 60,02 no broker (slippage + emolumentos) vs R$ 60,00
+      // de caixa; o dimensionamento cost-aware devolve 5 ações, que o broker aceita.
+      expect(buy).toMatchObject({ action: 'BUY', quantity: 5 });
       const sell = applyB3Risk({ action: 'SELL', requestedBrl: 20, price: 10, account: bank, position, rules: b3Rules, maxPositionPercent: 100, duplicateOrderPending: false });
       expect(sell).toMatchObject({ action: 'SELL', quantity: 2 });
       const all = applyB3Risk({ action: 'SELL', requestedBrl: 0, price: 10, account: bank, position, rules: b3Rules, maxPositionPercent: 100, duplicateOrderPending: false });
@@ -143,6 +147,55 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
 
       expect(result.action).toBe('HOLD');
       expect(result.rejectionReason).toMatch(/close-only mode/);
+    });
+
+    it('triggers protective SELL during isDayTradeCloseOnly when position is in profit (locking in gains before EOD unwind)', () => {
+      // Posição com entrada a R$ 30,00 e preço atual a R$ 30,50 (+1,67%) cobrindo custos
+      const result = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 30.50,
+        account: b3Account,
+        position: {
+          ticker: 'ITUB4',
+          quantity: 3,
+          entryPrice: 30.00,
+          costBrl: 90.00,
+        },
+        rules: b3Rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        isDayTradeCloseOnly: true,
+      });
+
+      expect(result.action).toBe('SELL');
+      expect(result.quantity).toBe(3);
+      expect(result.amountBrl).toBe(91.50);
+      expect(result.rejectionReason).toMatch(/EOD protective profit take: locking in \+1\.67% gain/);
+    });
+
+    it('triggers protective SELL during isDayTradeCloseOnly even if AI attempted BUY while position is in profit', () => {
+      const result = applyB3Risk({
+        action: 'BUY',
+        requestedBrl: 50,
+        price: 30.10,
+        account: b3Account,
+        position: {
+          ticker: 'ITUB4',
+          quantity: 2,
+          entryPrice: 30.00,
+          costBrl: 60.00,
+        },
+        rules: b3Rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        isDayTradeCloseOnly: true,
+      });
+
+      expect(result.action).toBe('SELL');
+      expect(result.quantity).toBe(2);
+      expect(result.amountBrl).toBe(60.20);
+      expect(result.rejectionReason).toMatch(/EOD protective profit take/);
     });
 
     it('allows SELL of full position', () => {
@@ -263,8 +316,8 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       expect(prompt).toContain('Risco:Retorno mínima 2:1');
       expect(prompt).toContain('PROTEÇÃO DE BREAKEVEN ATIVA');
       expect(prompt).toContain('Stop Loss Efetivo: R$ 35.02');
-      expect(prompt).toContain('Take Profit Parcial (+1,0%): R$ 35.35');
-      expect(prompt).toContain('Take Profit Total (+2,0%): R$ 35.70');
+      expect(prompt).toContain('Take Profit Parcial (+0.6%): R$ 35.21');
+      expect(prompt).toContain('Take Profit Total Mecânico (+1.5%): R$ 35.52');
       expect(prompt).toContain('proibido ficar em HOLD passivo');
     });
 
@@ -388,6 +441,154 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
       expect(result.rejectionReason).toContain('Automatic breakeven/trailing stop triggered');
     });
 
+    it('locks trailing stop floor at trailingStopCapPct without triggering stop prematurely on normal pullbacks above the cap', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      // Entrada a R$ 30.00. Subiu até R$ 31.00 (+3.33%).
+      // Trailing stop sem cap seria: 31.00 * (1 - 0.006) = 30.81 (+2.70%).
+      // Com trailingStopCapPct = 0.015 (+1.5%): capPrice = 30.00 * 1.015 = 30.45.
+      // O piso de stop estaciona em R$ 30.45.
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+        highestPrice: 31.00,
+      };
+
+      // Cenário 1: Preço oscila para R$ 30.70 (abaixo de 30.81, mas acima do teto travado 30.45).
+      // Não deve estopar prematuramente (mantém HOLD, permitindo fôlego para o trade).
+      const resultHold = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 30.70,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        breakevenTriggerPct: 0.008,
+        trailingStopPct: 0.006,
+        trailingStopCapPct: 0.015,
+      });
+
+      expect(resultHold.action).toBe('HOLD');
+      expect(resultHold.rejectionReason).toBe('AI requested HOLD');
+
+      // Cenário 2: Preço perde o teto protegido (cai para R$ 30.40 <= 30.45).
+      // Deve acionar o stop protegido com lucro garantido (+1.5%).
+      const resultSell = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 30.40,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        breakevenTriggerPct: 0.008,
+        trailingStopPct: 0.006,
+        trailingStopCapPct: 0.015,
+      });
+
+      expect(resultSell.action).toBe('SELL');
+      expect(resultSell.quantity).toBe(2);
+      expect(resultSell.amountBrl).toBe(60.80);
+      expect(resultSell.rejectionReason).toContain('Automatic breakeven/trailing stop triggered');
+      expect(resultSell.rejectionReason).toContain('floor R$ 30.45');
+    });
+
+    it('blocks discretionary panic SELL when position has negative PnL but price is above effective stop loss', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      const position = {
+        ticker: 'BBDC4',
+        quantity: 3,
+        entryPrice: 30.50,
+        costBrl: 91.50,
+        highestPrice: 30.59,
+      };
+
+      // Preço caiu para R$ 30.28 (PnL -0.72%, fora da banda de ruído de 0.40%).
+      // Porém, o Stop Loss de 1.8% (ou 1.2%) está em R$ 29.95 / R$ 30.13 (preço > stop).
+      // A IA emite SELL por ansiedade/medo. O motor de risco DEVE bloquear a saída prematura.
+      const result = applyB3Risk({
+        action: 'SELL',
+        requestedBrl: 90.84,
+        price: 30.28,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        maxStopLossPct: 0.018, // Stop em R$ 29.95
+        sellNoiseBandPct: 0.004,
+      });
+
+      expect(result.action).toBe('HOLD');
+      expect(result.rejectionReason).toContain('Discretionary panic exit with negative PnL');
+      expect(result.rejectionReason).toContain('blocked');
+    });
+
+    it('respects configured stopLossPct harmonized with prompt when price reaches stop level', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 10, realizedPnlBrl: 0 };
+      const position = {
+        ticker: 'BBAS3',
+        quantity: 3,
+        entryPrice: 30.08,
+        costBrl: 90.24,
+      };
+
+      // Com stopLossPct = 0.012 (1.2%), stop price = 30.08 * (1 - 0.012) = 29.719 -> ~29.72.
+      // Preço em R$ 29.70 (-1.26%) viola o stop loss operacional.
+      const result = applyB3Risk({
+        action: 'SELL',
+        requestedBrl: 90.24,
+        price: 29.70,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        stopLossPct: 0.012,
+        maxStopLossPct: 0.018, // Clamp rígido de 1.8%
+      });
+
+      // Como o preço violou os 1.2% de stop operacional, a venda NÃO pode ser bloqueada como pânico.
+      expect(result.action).toBe('SELL');
+      expect(result.quantity).toBe(3);
+    });
+
+    it('ensures trailing stop floor never drops below breakeven (entryPrice * 1.0006)', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      // Entrada a R$ 30.00. Subiu para R$ 30.25 (+0.83% >= breakevenTrigger 0.8%).
+      // breakevenPrice = 30.00 * 1.0006 = 30.02.
+      // Se trailingFloor fosse 30.25 * (1 - 0.01) = 29.95 (abaixo de breakeven).
+      // Piso protegido deve ser pelo menos 30.02.
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+        highestPrice: 30.25,
+      };
+
+      const result = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 30.01, // Abaixo do breakeven 30.02
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        breakevenTriggerPct: 0.008,
+        trailingStopPct: 0.01,
+        trailingStopCapPct: 0.015,
+      });
+
+      expect(result.action).toBe('SELL');
+      expect(result.rejectionReason).toContain('floor R$ 30.02');
+    });
+
     it('contextualizes Breakeven and Trailing Stop status in buildB3Prompt when active', () => {
       const prompt = buildB3Prompt(
         {} as any,
@@ -396,10 +597,371 @@ describe('B3 Stock Day Trade & Connector Suite', () => {
         30.15,
       );
 
-      expect(prompt).toContain('PROTEÇÃO DE BREAKEVEN ATIVA');
+      expect(prompt).toContain('PROTEÇÃO DE BREAKEVEN ATIVA COM LUCRO TRAVADO');
       expect(prompt).toContain('máxima atingida R$ 30.30');
-      expect(prompt).toContain('preço de custo R$ 30.02');
+      expect(prompt).toContain('Stop de Proteção foi elevado para R$ 30.02');
       expect(prompt).toContain('É expressamente proibido deixar a posição devolver ganhos');
+    });
+
+    it('calibrates dynamic stop loss based on ATR volatility in applyB3Risk', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      // Posição: entrada a R$ 30.00
+      // ATR = 0.15. Multiplicador = 2.0 -> Distância = 0.30 -> Stop loss = 0.30 / 30.00 = 1.0% (0.010)
+      // maxStopLossPct rígido = 0.018 (1.8%)
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+      };
+
+      // Preço cai para R$ 29.75 -> Perda = (30.00 - 29.75)/30.00 = 0.83% (< 1.0% do ATR).
+      // Deve manter HOLD seguro
+      const resultHold = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 29.75,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        stopLossMode: 'ATR',
+        atr: 0.15,
+        atrMultiplier: 2.0,
+        maxStopLossPct: 0.018,
+      });
+      expect(resultHold.action).toBe('HOLD');
+
+      // Preço cai para R$ 29.65 -> Perda = (30.00 - 29.65)/30.00 = 1.17% (>= 1.0% do stop ATR).
+      // Deve acionar SELL para estopar baseado na volatilidade real
+      const resultSell = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 29.65,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        stopLossMode: 'ATR',
+        atr: 0.15,
+        atrMultiplier: 2.0,
+        maxStopLossPct: 0.018,
+      });
+      expect(resultSell.action).toBe('SELL');
+      expect(resultSell.rejectionReason).toContain('Automatic stop loss triggered');
+      expect(resultSell.quantity).toBe(2);
+      expect(resultSell.amountBrl).toBe(59.30);
+    });
+
+    it('clamps ATR stop loss to MAX_STOP_LOSS_PCT when volatility exceeds the safety cap', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      // Posição: entrada a R$ 30.00
+      // Ativo muito volátil: ATR = 0.40. Multiplicador = 2.0 -> Distância = 0.80 -> Stop ATR seria 0.80/30.00 = 2.67%.
+      // Porém maxStopLossPct = 0.018 (1.8% -> R$ 0.54 de perda máxima, stop em R$ 29.46).
+      // O motor de risco NUNCA pode furar o teto rígido de segurança MAX_STOP_LOSS_PCT.
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+      };
+
+      // Preço cai para R$ 29.40 -> Perda = (30.00 - 29.40)/30.00 = 2.0% (abaixo do ATR de 2.67%, mas acima do teto de 1.8%).
+      // O teto rígido deve proteger a conta e acionar SELL compulsório.
+      const result = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 29.40,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        stopLossMode: 'ATR',
+        atr: 0.40,
+        atrMultiplier: 2.0,
+        maxStopLossPct: 0.018,
+      });
+
+      expect(result.action).toBe('SELL');
+      expect(result.rejectionReason).toContain('Automatic stop loss triggered');
+    });
+
+    it('falls back safely to static maxStopLossPct when in STATIC mode or when ATR is unavailable/zero', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 30, realizedPnlBrl: 0 };
+      const position = {
+        ticker: 'PETR4',
+        quantity: 2,
+        entryPrice: 30.0,
+        costBrl: 60.0,
+      };
+
+      // Com stopLossMode = 'STATIC', ignora ATR e usa maxStopLossPct (1.5%)
+      const resultStatic = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 29.50, // Perda = 1.67% (ultrapassa 1.5%)
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        stopLossMode: 'STATIC',
+        atr: 0.10, // ATR menor que resultaria em 0.67%, mas ignorado porque está em STATIC
+        maxStopLossPct: 0.015,
+      });
+      expect(resultStatic.action).toBe('SELL');
+
+      // Com stopLossMode = 'ATR' mas ATR nulo ou 0: fallback seguro para maxStopLossPct
+      const resultFallback = applyB3Risk({
+        action: 'HOLD',
+        requestedBrl: 0,
+        price: 29.50,
+        account: bank,
+        position,
+        rules,
+        maxPositionPercent: 100,
+        duplicateOrderPending: false,
+        stopLossMode: 'ATR',
+        atr: null,
+        maxStopLossPct: 0.015,
+      });
+      expect(resultFallback.action).toBe('SELL');
+    });
+
+    describe('Automatic mechanical partial take profit (Scale-out)', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 20, realizedPnlBrl: 0 };
+      // Posição de 4 ações a R$ 20.00 (custo R$ 80.00)
+      const position = {
+        ticker: 'PETR4',
+        quantity: 4,
+        entryPrice: 20.0,
+        costBrl: 80.0,
+      };
+
+      it('forces SELL of 50% position when price reaches partial target (+1.0%) even if AI requested HOLD', () => {
+        // Preço sobe para R$ 20.20 (+1.00%)
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 20.20,
+          account: bank,
+          position,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          partialTakeProfitTriggerPct: 0.010,
+          partialTakeProfitRatio: 0.5,
+        });
+
+        expect(result.action).toBe('SELL');
+        expect(result.quantity).toBe(2); // 4 * 0.5 = 2
+        expect(result.amountBrl).toBe(40.40); // 2 * 20.20
+        expect(result.rejectionReason).toBe('Automatic partial take profit triggered at +1.00%');
+      });
+
+      it('forces SELL of 50% position when price reaches partial target even if AI requested BUY', () => {
+        // Preço em R$ 20.25 (+1.25%)
+        const result = applyB3Risk({
+          action: 'BUY',
+          requestedBrl: 10,
+          price: 20.25,
+          account: bank,
+          position,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          partialTakeProfitTriggerPct: 0.010,
+          partialTakeProfitRatio: 0.5,
+        });
+
+        expect(result.action).toBe('SELL');
+        expect(result.quantity).toBe(2);
+        expect(result.amountBrl).toBe(40.50);
+        expect(result.rejectionReason).toBe('Automatic partial take profit triggered at +1.25%');
+      });
+
+      it('calculates quantityToSell as Math.max(1, Math.floor(quantity * ratio)) for odd positions', () => {
+        // Posição com 3 ações a R$ 20.00: 3 * 0.5 = 1.5 -> Math.floor = 1
+        const oddPosition = { ...position, quantity: 3, costBrl: 60.0 };
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 20.20,
+          account: bank,
+          position: oddPosition,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          partialTakeProfitTriggerPct: 0.010,
+          partialTakeProfitRatio: 0.5,
+        });
+
+        expect(result.action).toBe('SELL');
+        expect(result.quantity).toBe(1);
+        expect(result.amountBrl).toBe(20.20);
+      });
+
+      it('does NOT trigger partial take profit when position.quantity is 1', () => {
+        const singlePosition = { ...position, quantity: 1, costBrl: 20.0 };
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 20.20,
+          account: bank,
+          position: singlePosition,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          partialTakeProfitTriggerPct: 0.010,
+          partialTakeProfitRatio: 0.5,
+        });
+
+        expect(result.action).toBe('HOLD');
+        expect(result.rejectionReason).toBe('AI requested HOLD');
+      });
+
+      it('does NOT trigger partial take profit when gain is below trigger pct', () => {
+        // Preço a R$ 20.15 (+0.75% < +1.0%)
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 20.15,
+          account: bank,
+          position,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          partialTakeProfitTriggerPct: 0.010,
+          partialTakeProfitRatio: 0.5,
+        });
+
+        expect(result.action).toBe('HOLD');
+      });
+
+      it('does NOT re-trigger partial take profit if partialTakeProfitDone is already true', () => {
+        // Preço a R$ 20.30 (+1.5%), mas parcial já realizada no trade
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 20.30,
+          account: bank,
+          position,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          partialTakeProfitTriggerPct: 0.010,
+          partialTakeProfitRatio: 0.5,
+          partialTakeProfitDone: true,
+        });
+
+        expect(result.action).toBe('HOLD');
+        expect(result.rejectionReason).toBe('AI requested HOLD');
+      });
+    });
+
+    describe('Automatic mechanical Full Take Profit (Full TP) and Profit Lock-in', () => {
+      const bank = { initialBankBrl: 100, cashBrl: 20, realizedPnlBrl: 0 };
+      const position = {
+        ticker: 'PETR4',
+        quantity: 3,
+        entryPrice: 30.00,
+        costBrl: 90.00,
+        highestPrice: 30.25,
+      };
+
+      it('forces 100% liquidation via SELL when price reaches fullTakeProfitPct (+0.8%) even if AI requested HOLD', () => {
+        // Preço atinge R$ 30.25 (+0.833% >= +0.80%)
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 30.25,
+          account: bank,
+          position,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          fullTakeProfitPct: 0.008,
+        });
+
+        expect(result.action).toBe('SELL');
+        expect(result.quantity).toBe(3); // 100% da posição
+        expect(result.amountBrl).toBe(90.75); // 3 * 30.25
+        expect(result.rejectionReason).toContain('Automatic full take profit triggered at +0.83%');
+      });
+
+      it('blocks BUY and forces HOLD if AI tries to buy at full take profit target', () => {
+        const result = applyB3Risk({
+          action: 'BUY',
+          requestedBrl: 30,
+          price: 30.25,
+          account: bank,
+          position,
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          fullTakeProfitPct: 0.008,
+        });
+
+        expect(result.action).toBe('HOLD');
+        expect(result.rejectionReason).toContain('position hit full take profit target');
+      });
+
+      it('protects gains with Breakeven Profit Lock-in (entryPrice * (1 + breakevenProfitLockPct))', () => {
+        // Comprou a R$ 30.00, subiu até R$ 30.25 (+0.83%), ativando Breakeven (>= 0.5%).
+        // Com breakevenProfitLockPct = 0.002 (+0.2%), o piso garantido é 30.00 * 1.002 = R$ 30.06.
+        // Se o preço recuar para R$ 30.05, deve estopar travando o lucro líquido e sem deixar virar prejuízo!
+        const result = applyB3Risk({
+          action: 'HOLD',
+          requestedBrl: 0,
+          price: 30.05, // Abaixo do piso de R$ 30.06
+          account: bank,
+          position: { ...position, highestPrice: 30.25 },
+          rules,
+          maxPositionPercent: 100,
+          duplicateOrderPending: false,
+          breakevenTriggerPct: 0.005,
+          breakevenProfitLockPct: 0.002,
+        });
+
+        expect(result.action).toBe('SELL');
+        expect(result.quantity).toBe(3);
+        expect(result.amountBrl).toBe(90.15); // 3 * 30.05 (lucro garantido!)
+        expect(result.rejectionReason).toContain('Automatic breakeven/trailing stop triggered');
+        expect(result.rejectionReason).toContain('floor R$ 30.06');
+      });
+    });
+
+    it('reports ATR volatility and calibrated stop in buildB3Prompt', () => {
+      const prompt = buildB3Prompt(
+        {
+          symbol: 'PETR4',
+          capturedAt: new Date().toISOString(),
+          atr: 0.35,
+          intervals: {
+            '1m': { price: 35.0, atr: 0.35 },
+            '5m': { price: 35.0, atr: 0.35 },
+            '15m': { price: 35.0, atr: 0.35 },
+          },
+        } as any,
+        { initialBankBrl: 100, cashBrl: 50 },
+        { ticker: 'PETR4', quantity: 1, entryPrice: 35.0, costBrl: 35.0 },
+        35.0,
+        0.012,
+        0.008,
+        {},
+        {
+          atr: 0.35,
+          atrMultiplier: 2.0,
+          stopLossMode: 'ATR',
+        },
+      );
+
+      expect(prompt).toContain('Volatilidade Real (ATR 14): R$ 0.3500 por ação');
+      expect(prompt).toContain('Stop ATR (2.0x ATR)');
+      expect(prompt).toContain('2.0x ATR = R$ 0.70');
     });
   });
 

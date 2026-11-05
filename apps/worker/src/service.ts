@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { config, defaultTradingConfiguration, logger, sessionPhase, type TradingConfiguration } from '@bolinha/core';
-import { evaluateCandlesEntryConfluence, makeSnapshot } from '@bolinha/market-data';
-import { OpenRouterClient, buildB3Prompt } from '@bolinha/ai';
+import { atSessionTime, config, defaultTradingConfiguration, logger, parseTradingSymbols, sessionDay, sessionPhase, type Action, type TradingConfiguration } from '@bolinha/core';
+import { evaluateCandlesEntryConfluence, makeSnapshot, runRobotsPreAnalysis } from '@bolinha/market-data';
+import { OpenRouterClient, buildB3Prompt, type AiDecision, type AiUsage } from '@bolinha/ai';
 import { applyB3Risk } from '@bolinha/risk-engine';
-import { createBrokerGateway, type BrokerGateway, type ExchangeOrder } from '@bolinha/exchange';
+import { createBrokerGateway, type BrokerGateway, type ExchangeOrder, type B3AssetSetup } from '@bolinha/exchange';
 import { executionAccounting } from '@bolinha/database';
 import { TradingRepository } from '@bolinha/database';
 
@@ -22,9 +22,12 @@ export class TradingService {
       config.OPENROUTER_TIMEOUT_MS,
     ),
     private positionHighWatermark = new Map<string, number>(),
+    private partialTakeProfitPositions = new Set<string>(),
+    /** TASK-41: Timestamp da última compra (tranche) por ativo para controle de cooldown de escalonamento. */
+    private lastBuyExecutionAt = new Map<string, Date>(),
     /** Signature (price@time) of the last persisted dashboard point, to avoid duplicates. */
     private lastAccountSnapshot: string | null = null,
-  ) {}
+  ) { }
 
   private async event(severity: Severity, type: string, message: string, metadata?: unknown) {
     await this.repo.event(severity, type, message, metadata);
@@ -109,9 +112,11 @@ export class TradingService {
 
   private async persistExecution(
     local: { id: number; clientOrderId: string },
-    order: Pick<ExchangeOrder, 'orderId' | 'side' | 'executedQty' | 'cummulativeQuoteQty' | 'commission' | 'transactTime'> & { fills?: ExchangeOrder['fills'] },
+    order: Pick<ExchangeOrder, 'orderId' | 'side' | 'executedQty' | 'cummulativeQuoteQty' | 'commission' | 'transactTime'> & { fills?: ExchangeOrder['fills']; ticker?: string },
     eventType: 'normal' | 'reconciliation' = 'normal',
+    tradeSymbol?: string,
   ) {
+    const symbol = (order.ticker ?? tradeSymbol ?? config.SYMBOL).toUpperCase();
     const outcome = await this.repo.recordExecution({
       id: local.id,
       brokerOrderId: order.orderId,
@@ -121,12 +126,14 @@ export class TradingService {
       commission: order.commission,
       fills: order.fills,
       at: order.transactTime,
+      symbol,
     });
     // Older lightweight test doubles return void; production repository always
     // returns the explicit idempotency outcome.
     const applied = outcome?.applied ?? true;
     await this.event('INFO', 'order_executed', 'Testnet order executed', {
       side: order.side,
+      symbol,
       orderId: order.orderId,
       clientOrderId: local.clientOrderId,
       quantity: order.executedQty,
@@ -140,7 +147,7 @@ export class TradingService {
         'INFO',
         order.side === 'BUY' ? 'position_opened' : 'position_closed',
         'Conceptual position updated',
-        { side: order.side, quantity: order.executedQty, netPositionQuantity: executionAccounting(order.side, order.executedQty, order.cummulativeQuoteQty, order.fills ?? []).positionQuantity, quoteAmount: order.cummulativeQuoteQty, source: eventType },
+        { symbol, side: order.side, quantity: order.executedQty, netPositionQuantity: executionAccounting(order.side, order.executedQty, order.cummulativeQuoteQty, order.fills ?? []).positionQuantity, quoteAmount: order.cummulativeQuoteQty, source: eventType },
       );
     // The panel reads cash/position/unrealized from PostgreSQL for the current
     // day, but the time series still needs a point per executed order so a
@@ -227,6 +234,28 @@ export class TradingService {
         await this.event('ERROR', 'state_inconsistency_detected', 'Ledger consistency check failed after reconciliation', { reason: consistency.reason });
         throw new Error(consistency.reason ?? 'Ledger consistency check failed');
       }
+
+      // Sincroniza a posição aberta do ledger conceitual (PostgreSQL) com o gateway de execução.
+      // Em paper trading ou após reinício do worker/contêineres, o broker em memória precisa
+      // refletir a posição e o ticker que foram abertos no banco.
+      if (typeof this.exchange.syncPosition === 'function') {
+        const currentOpenPos = await this.repo.openPosition();
+        if (currentOpenPos) {
+          const ticker = (currentOpenPos.symbol ?? config.SYMBOL).toUpperCase();
+          this.exchange.syncPosition({
+            ticker,
+            quantity: currentOpenPos.quantity,
+            entryPrice: currentOpenPos.entryPrice,
+            costBrl: currentOpenPos.costUsdt,
+          });
+          if (typeof this.exchange.setTicker === 'function') {
+            this.exchange.setTicker(ticker);
+          }
+        } else {
+          this.exchange.syncPosition(null);
+        }
+      }
+
       await reconciliationRepo.reconciliationCompleted();
       await this.event('INFO', 'reconciliation_completed', `${context === 'startup' ? 'Startup' : 'Runtime'} reconciliation completed`, { pendingOrderCount: 0 });
       return { status: 'OK' as const, pendingOrders: 0 };
@@ -243,6 +272,7 @@ export class TradingService {
     quantity: number,
     amountUsdt: number,
     minPrice?: number,
+    symbol?: string,
   ) {
     const pendingRepository = this.repo as TradingRepository & {
       pendingOrderDetails?: () => Promise<{
@@ -264,6 +294,7 @@ export class TradingService {
       await this.event('INFO', 'order_submitted', 'Testnet market order submitted', {
         clientOrderId,
         side,
+        symbol,
         quantity,
         amountUsdt,
       });
@@ -317,7 +348,7 @@ export class TradingService {
       : order.executedQty;
     if (order.status !== 'FILLED' || order.side !== side || Math.abs(fulfilledQuantity - quantity) > 1e-12)
       throw new Error('Refusing to persist an execution that does not fully match the requested quantity');
-    await this.persistExecution({ id: orderId, clientOrderId }, order);
+    await this.persistExecution({ id: orderId, clientOrderId }, order, 'normal', symbol);
     return order;
   }
 
@@ -350,7 +381,8 @@ export class TradingService {
       await this.event('WARN', 'cycle_skipped', 'Trading cycle blocked pending reconciliation', { reason: ready.reason });
       return { action: 'HOLD' as const, reason: ready.reason };
     }
-    const hasPosition = Boolean(await this.repo.openPosition());
+    const openPos = await this.repo.openPosition();
+    const hasPosition = Boolean(openPos);
     const phase = sessionPhase(at, configuration, hasPosition);
     if (phase === 'BEFORE_START' || phase === 'FINISHED') {
       await this.event('INFO', 'cycle_skipped', 'Trading cycle skipped outside the daily session', { phase });
@@ -360,17 +392,71 @@ export class TradingService {
       await this.event('INFO', 'cycle_skipped', 'Trading cycle skipped during no-new-positions window without an open position', { phase });
       return { action: 'HOLD' as const, reason: `Session phase is ${phase} and there is no open position` };
     }
+
+    // Circuit Breaker (Daily Loss Limit) no início do ciclo operacional:
+    // Se não há posição aberta e a perda diária acumulada atingiu o teto configurado,
+    // interrompe novas entradas no dia (fail-closed) e emite evento WARN.
+    let dailyRealizedPnlBrl = 0;
+    const dailyPnlRepo = this.repo as TradingRepository & { dailyRealizedPnl?: () => Promise<number> };
+    if (dailyPnlRepo.dailyRealizedPnl) {
+      dailyRealizedPnlBrl = await dailyPnlRepo.dailyRealizedPnl();
+      const initialBank = configuration.initialBankUsdt > 0 ? configuration.initialBankUsdt : (config.INITIAL_BANK_BRL ?? 100);
+      const limitBrl = typeof config.DAILY_MAX_LOSS_BRL === 'number' && config.DAILY_MAX_LOSS_BRL > 0
+        ? config.DAILY_MAX_LOSS_BRL
+        : initialBank * (config.DAILY_MAX_LOSS_PCT ?? 0.05);
+
+      if (dailyRealizedPnlBrl <= -limitBrl && !hasPosition) {
+        await this.event('WARN', 'daily_loss_limit_triggered', 'Daily loss limit reached; new positions blocked for today', {
+          dailyRealizedPnlBrl,
+          maxDailyLossBrl: limitBrl,
+          dailyMaxLossPct: config.DAILY_MAX_LOSS_PCT,
+          dailyMaxLossBrl: config.DAILY_MAX_LOSS_BRL,
+        });
+        return {
+          action: 'HOLD' as const,
+          reason: `Daily loss limit reached (-R$ ${Math.abs(dailyRealizedPnlBrl).toFixed(2)} / limit -R$ ${limitBrl.toFixed(2)})`,
+        };
+      }
+    }
+
     if (phase === 'FORCE_CLOSE' || phase === 'FORCE_CLOSE_PENDING') return this.forceClosePositionLocked(configuration);
-    await this.event('INFO', 'cycle_started', 'Trading cycle started', { symbol: config.SYMBOL });
+
+    let activeSymbol = (openPos?.symbol ?? config.SYMBOL).toUpperCase();
+    let setupCandidate: B3AssetSetup | null = null;
+    const marketDataService = typeof this.exchange.getMarketData === 'function' ? this.exchange.getMarketData() : null;
+
+    if (!hasPosition && marketDataService) {
+      const candidates = parseTradingSymbols();
+      const setups = await marketDataService.scanAndRankSetups(candidates);
+      const eligible = setups.filter((s) => s.confluence?.allowed);
+      const topCandidate = eligible[0] ?? setups[0] ?? null;
+
+      await this.event('INFO', 'scanner_scan_completed', 'Multi-asset scanner evaluated setups across B3 basket', {
+        scanned: setups.map((s) => ({ ticker: s.ticker, score: s.score, price: s.price, trend: s.trend, confluent: Boolean(s.confluence?.allowed) })),
+        eligibleCount: eligible.length,
+        selectedSymbol: topCandidate?.ticker ?? activeSymbol,
+      });
+
+      if (topCandidate) {
+        setupCandidate = topCandidate;
+        activeSymbol = topCandidate.ticker;
+      }
+    }
+
+    if (typeof this.exchange.setTicker === 'function') {
+      this.exchange.setTicker(activeSymbol);
+    }
+
+    await this.event('INFO', 'cycle_started', 'Trading cycle started', { symbol: activeSymbol, hasPosition });
     try {
       let market;
       try {
         market = await Promise.all([
-          this.exchange.candles('1m'),
-          this.exchange.candles('5m'),
-          this.exchange.candles('15m'),
+          setupCandidate?.candles ? Promise.resolve(setupCandidate.candles['1m']) : this.exchange.candles('1m'),
+          setupCandidate?.candles ? Promise.resolve(setupCandidate.candles['5m']) : this.exchange.candles('5m'),
+          setupCandidate?.candles ? Promise.resolve(setupCandidate.candles['15m']) : this.exchange.candles('15m'),
           this.repo.account(),
-          this.repo.openPosition(),
+          Promise.resolve(openPos),
           this.exchange.rules(),
           this.repo.pendingOrder(),
         ]);
@@ -380,7 +466,7 @@ export class TradingService {
           'ERROR',
           'external_service_error',
           'Could not retrieve market data or exchange rules',
-          { service: 'broker', error: message },
+          { service: 'broker', symbol: activeSymbol, error: message },
         );
         throw error;
       }
@@ -388,24 +474,29 @@ export class TradingService {
 
       // Filtro de entrada multi-timeframe (fail-closed): candle insuficiente,
       // série ausente, indicador NaN ou falta de confluência 1m/5m/15m => BUY vira HOLD.
-      const entryConfluence = config.ENTRY_FILTER_ENABLED
+      const entryConfluence = setupCandidate?.confluence ?? (config.ENTRY_FILTER_ENABLED
         ? evaluateCandlesEntryConfluence(
-            { '1m': one, '5m': five, '15m': fifteen },
-            {
-              timeframes: config.ENTRY_TIMEFRAMES,
-              minConfluentTimeframes: config.ENTRY_MIN_CONFLUENT_TIMEFRAMES,
-              rsiOverboughtThreshold: config.ENTRY_RSI_OVERBOUGHT,
-            },
-          )
-        : null;
+          { '1m': one, '5m': five, '15m': fifteen },
+          {
+            timeframes: config.ENTRY_TIMEFRAMES,
+            minConfluentTimeframes: config.ENTRY_MIN_CONFLUENT_TIMEFRAMES,
+            rsiOverboughtThreshold: config.ENTRY_RSI_OVERBOUGHT,
+            rsiOversoldThreshold: config.ENTRY_RSI_OVERSOLD,
+            maxVwapDistancePct: config.ENTRY_MAX_VWAP_DISTANCE_PCT,
+            maxEmaDistancePct: config.ENTRY_MAX_EMA_DISTANCE_PCT,
+            requireVwapAbove: config.ENTRY_REQUIRE_VWAP_ABOVE,
+          },
+        )
+        : null);
 
       let snapshot;
       try {
-        snapshot = makeSnapshot(config.SYMBOL, { '1m': one, '5m': five, '15m': fifteen });
+        snapshot = setupCandidate?.snapshot ?? makeSnapshot(activeSymbol, { '1m': one, '5m': five, '15m': fifteen });
       } catch (error) {
         // Sem indicadores válidos não existe decisão confiável: HOLD observável, nunca BUY.
         const message = error instanceof Error ? error.message : 'Invalid market data';
         await this.event('WARN', 'cycle_skipped', 'Trading cycle held because market data is insufficient', {
+          symbol: activeSymbol,
           reason: message,
           entryConfluence: entryConfluence?.reason ?? null,
         });
@@ -419,37 +510,164 @@ export class TradingService {
         await dashboardRepo.saveAccountSnapshot(snapshot.intervals['1m'].price, at);
       const currentPrice = snapshot.intervals['1m'].price;
       const b3Account = { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt };
-      const symbol = config.SYMBOL.toUpperCase();
+      const symbol = activeSymbol;
       let highest = this.positionHighWatermark.get(symbol);
       if (position) {
         highest = Math.max(highest ?? position.entryPrice, currentPrice);
         this.positionHighWatermark.set(symbol, highest);
       } else {
         this.positionHighWatermark.delete(symbol);
+        this.partialTakeProfitPositions.delete(symbol);
+        this.lastBuyExecutionAt.delete(symbol);
       }
+
+      const partialDone = this.partialTakeProfitPositions.has(symbol);
 
       const b3Position = position
         ? {
-            ticker: config.SYMBOL,
-            quantity: position.quantity,
-            entryPrice: position.entryPrice,
-            costBrl: position.costUsdt,
-            highestPrice: highest,
-          }
+          ticker: position.symbol ?? activeSymbol,
+          quantity: position.quantity,
+          entryPrice: position.entryPrice,
+          costBrl: position.costUsdt,
+          openedAt: position.openedAt,
+          highestPrice: highest,
+          partialTakeProfitDone: partialDone,
+        }
         : null;
 
-      const response = await this.ai.decide(
-        buildB3Prompt(snapshot, b3Account, b3Position, currentPrice, config.STOP_LOSS_PCT),
+      const trailingStopCapPct = configuration.trailingStopCapPct ?? config.TRAILING_STOP_CAP_PCT;
+      const assetAtr = snapshot.atr ?? snapshot.intervals?.['5m']?.atr ?? snapshot.intervals?.['1m']?.atr ?? null;
+
+      // Execução dos Robôs Pré-Analistas Determinísticos (Sem IA):
+      // Analisam os múltiplos fatores técnicos, matemáticos e de posição, gerando
+      // opções pré-qualificadas para que a IA decida a partir delas.
+      const robotsPreAnalysis = runRobotsPreAnalysis(
+        snapshot,
+        currentPrice,
+        b3Position ? {
+          ticker: b3Position.ticker,
+          quantity: b3Position.quantity,
+          entryPrice: b3Position.entryPrice,
+          costBrl: b3Position.costBrl,
+          highestPrice: b3Position.highestPrice,
+          effectiveStopLossPct: config.STOP_LOSS_PCT,
+          breakevenTriggerPct: config.BREAKEVEN_TRIGGER_PCT,
+          trailingStopPct: config.TRAILING_STOP_PCT,
+          partialTakeProfitTriggerPct: config.PARTIAL_TAKE_PROFIT_TRIGGER_PCT,
+          fullTakeProfitPct: config.FULL_TAKE_PROFIT_PCT,
+          profitTargetMode: config.PROFIT_TARGET_CALCULATION_MODE,
+          dayTradeTaxRate: config.DAY_TRADE_TAX_RATE,
+        } : null,
+        entryConfluence,
       );
-      if (response.usage.fallbackUsed)
-        await this.event('WARN', 'ai_fallback', 'OpenRouter fallback model was used', {
-          model: response.usage.modelRequested,
-          reason: response.usage.fallbackReason ?? 'Previous model failed',
+
+      await this.event('INFO', 'robots_pre_analysis_completed', 'Robots pre-analysis completed', {
+        symbol: activeSymbol,
+        consensusAction: robotsPreAnalysis.consensusAction,
+        consensusScore: robotsPreAnalysis.consensusScore,
+        optionsCount: robotsPreAnalysis.recommendedOptions.length,
+        recommendedOptions: robotsPreAnalysis.recommendedOptions,
+        requiresAiDecision: robotsPreAnalysis.requiresAiDecision,
+        bypassReason: robotsPreAnalysis.bypassReason ?? null,
+      });
+
+      let response: { decision: AiDecision; usage: AiUsage };
+
+      if (!robotsPreAnalysis.requiresAiDecision) {
+        // Economia de IA: a pré-análise dos robôs determinísticos é conclusiva.
+        // Nenhuma chamada externa é feita ao OpenRouter, economizando 100% dos tokens e latência.
+        await this.event('INFO', 'ai_cycle_bypassed', 'AI invocation bypassed by deterministic robots pre-analysis', {
+          action: robotsPreAnalysis.consensusAction,
+          score: robotsPreAnalysis.consensusScore,
+          reason: robotsPreAnalysis.bypassReason,
         });
-      if (response.usage.error)
-        await this.event('ERROR', 'ai_error', 'OpenRouter did not return a usable decision', {
-          error: response.usage.error,
-        });
+
+        const defaultAmountUsdt = robotsPreAnalysis.consensusAction === 'BUY'
+          ? Math.min(account.cashUsdt, 100)
+          : (b3Position?.costBrl ?? 0);
+
+        response = {
+          decision: {
+            action: robotsPreAnalysis.consensusAction as Action,
+            amountUsdt: defaultAmountUsdt,
+            confidence: Number((robotsPreAnalysis.consensusScore / 100).toFixed(2)),
+            reason: `Decisão determinística dos robôs analistas: ${robotsPreAnalysis.bypassReason}`,
+            rawResponse: null,
+            parseFailed: false,
+          },
+          usage: {
+            modelRequested: 'deterministic_robots',
+            modelReturned: 'deterministic_robots',
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+            costUsd: 0,
+            latencyMs: 0,
+            error: null,
+            fallbackUsed: false,
+          },
+        };
+      } else {
+        response = await this.ai.decide(
+          buildB3Prompt(snapshot, b3Account, b3Position, currentPrice, config.STOP_LOSS_PCT, config.BREAKEVEN_TRIGGER_PCT, {}, {
+            // Mesmo headroom de custos usado no `applyB3Risk` abaixo: o prompt anuncia
+            // exatamente a quantidade que o motor de risco aprova (nunca maior).
+            buyCostBufferPct: config.RISK_BUY_COST_BUFFER_PCT,
+            // Mesmo teto de alocação por posição do `applyB3Risk` abaixo: com
+            // MAX_POSITION_PERCENT < 100 o motor aprova menos que o caixa permitiria.
+            maxPositionPercent: configuration.maxPositionPercent,
+            trailingStopPct: config.TRAILING_STOP_PCT,
+            trailingStopCapPct,
+            atr: assetAtr,
+            atrMultiplier: config.ATR_MULTIPLIER,
+            stopLossMode: config.STOP_LOSS_MODE,
+            fullTakeProfitPct: config.FULL_TAKE_PROFIT_PCT,
+            partialTakeProfitTriggerPct: config.PARTIAL_TAKE_PROFIT_TRIGGER_PCT,
+            breakevenProfitLockPct: config.BREAKEVEN_PROFIT_LOCK_PCT,
+            profitTargetMode: config.PROFIT_TARGET_CALCULATION_MODE,
+            dayTradeTaxRate: config.DAY_TRADE_TAX_RATE,
+            preAnalysis: robotsPreAnalysis,
+          }),
+        );
+        if (response.usage.rateLimit429Hit)
+          await this.event('WARN', 'ai_rate_limit_429', 'Rate limit HTTP 429 encountered during AI model invocation', {
+            model: response.usage.modelRequested,
+            retriesUsed: response.usage.retriesUsed ?? 0,
+          });
+        if (response.usage.fallbackUsed)
+          await this.event('WARN', 'ai_fallback', 'OpenRouter fallback model was used', {
+            model: response.usage.modelRequested,
+            reason: response.usage.fallbackReason ?? 'Previous model failed',
+          });
+        if (response.usage.error)
+          await this.event('ERROR', 'ai_error', 'OpenRouter did not return a usable decision', {
+            error: response.usage.error,
+          });
+
+        // TASK-38: Quando a decisão vem de modelo de fallback (menos assertivo que o primário),
+        // exige nível de confiança mais elevado (ex.: 0.70) para executar novas compras (BUY).
+        // Se a confiança for menor, rebaixa para HOLD seguro (fail-closed).
+        if (response.usage.fallbackUsed && response.decision.action === 'BUY') {
+          const minFallbackConf = config.AI_FALLBACK_MIN_CONFIDENCE ?? 0.70;
+          if (response.decision.confidence < minFallbackConf) {
+            await this.event('WARN', 'ai_fallback_low_confidence_buy_blocked', 'BUY from fallback model downgraded to HOLD due to low confidence', {
+              confidence: response.decision.confidence,
+              minConfidenceRequired: minFallbackConf,
+              model: response.usage.modelRequested,
+              originalAction: 'BUY',
+            });
+            response = {
+              ...response,
+              decision: {
+                ...response.decision,
+                action: 'HOLD',
+                amountUsdt: 0,
+                reason: `BUY rebaixado para HOLD pelo filtro de segurança de fallback (confiança ${(response.decision.confidence * 100).toFixed(0)}% < ${(minFallbackConf * 100).toFixed(0)}% mínima exigida para fallback). Motivo original: ${response.decision.reason}`,
+              },
+            };
+          }
+        }
+      }
 
       const b3Res = applyB3Risk({
         action: response.decision.action,
@@ -461,11 +679,49 @@ export class TradingService {
         maxPositionPercent: configuration.maxPositionPercent,
         duplicateOrderPending: pending,
         isDayTradeCloseOnly: phase === 'NO_NEW_POSITIONS',
+        stopLossPct: config.STOP_LOSS_PCT, // Stop loss base operacional (harmonizado com o prompt da IA)
         maxStopLossPct: config.MAX_STOP_LOSS_PCT, // Proteção rígida intradiária calibrada
-        breakevenTriggerPct: 0.008, // Ativa breakeven ao atingir +0.8%
-        trailingStopPct: 0.006, // Trailing stop de 0.6% a partir do topo
+        stopLossMode: config.STOP_LOSS_MODE,
+        atr: assetAtr,
+        atrMultiplier: config.ATR_MULTIPLIER,
+        breakevenTriggerPct: config.BREAKEVEN_TRIGGER_PCT,
+        breakevenProfitLockPct: config.BREAKEVEN_PROFIT_LOCK_PCT,
+        trailingStopPct: config.TRAILING_STOP_PCT,
+        trailingStopCapPct, // Teto máximo de proteção travado para dar fôlego ao trade
+        partialTakeProfitTriggerPct: config.PARTIAL_TAKE_PROFIT_TRIGGER_PCT,
+        partialTakeProfitRatio: config.PARTIAL_TAKE_PROFIT_RATIO,
+        partialTakeProfitDone: partialDone,
+        fullTakeProfitPct: config.FULL_TAKE_PROFIT_PCT,
+        profitTargetMode: config.PROFIT_TARGET_CALCULATION_MODE,
+        dayTradeTaxRate: config.DAY_TRADE_TAX_RATE,
+        minRewardRiskRatio: config.MIN_REWARD_RISK_RATIO,
+        minTargetCostMultiple: config.MIN_TARGET_COST_MULTIPLE,
+        minStopAtrMultiple: config.MIN_STOP_ATR_MULTIPLE,
+        riskPerTradePct: config.RISK_PER_TRADE_PCT,
         sellNoiseBandPct: 0.004, // SELL discricionário com |PnL| < 0.4% é ruído (atrito de slippage + taxas)
+        dailyRealizedPnlBrl,
+        dailyMaxLossPct: config.DAILY_MAX_LOSS_PCT,
+        dailyMaxLossBrl: config.DAILY_MAX_LOSS_BRL,
+        // Headroom de custos (slippage + emolumentos) reservado no dimensionamento do BUY,
+        // para que uma ordem aprovada pelo risco nunca seja rejeitada pelo broker.
+        buyCostBufferPct: config.RISK_BUY_COST_BUFFER_PCT,
         entryConfluence,
+        vwap: snapshot.vwap,
+        requireVwapAbove: config.ENTRY_REQUIRE_VWAP_ABOVE,
+        timeStopEnabled: config.TIME_STOP_ENABLED,
+        timeStopMinutes: config.TIME_STOP_MINUTES,
+        now: at,
+        entryScalingRatio: config.ENTRY_SCALING_RATIO,
+        entryScalingCooldownMinutes: config.ENTRY_SCALING_COOLDOWN_MINUTES,
+        minutesSinceLastBuy: (() => {
+          const lastBuy = this.lastBuyExecutionAt.get(activeSymbol) ?? b3Position?.openedAt;
+          return lastBuy ? Math.max(0, (at.getTime() - lastBuy.getTime()) / 60_000) : undefined;
+        })(),
+        openingNoTradeMinutes: config.OPENING_NO_TRADE_MINUTES,
+        minutesSinceSessionStart: Math.max(
+          0,
+          (at.getTime() - atSessionTime(sessionDay(at, configuration.timezone), configuration.start, configuration.timezone).getTime()) / 60_000,
+        ),
       });
       let risk = { action: b3Res.action, amountUsdt: b3Res.amountBrl, quantity: b3Res.quantity, rejectionReason: b3Res.rejectionReason };
       if (response.decision.action === 'BUY' && risk.action !== 'BUY' && risk.rejectionReason?.startsWith('BUY rejected by multi-timeframe entry filter')) {
@@ -475,6 +731,13 @@ export class TradingService {
           confluentCount: entryConfluence?.confluentCount ?? null,
           confluentTimeframes: entryConfluence?.confluentTimeframes ?? [],
           checks: entryConfluence?.checks ?? [],
+          vwap: snapshot.vwap ?? null,
+        });
+      } else if (response.decision.action === 'BUY' && risk.action !== 'BUY' && risk.rejectionReason?.includes('is below daily VWAP')) {
+        await this.event('WARN', 'vwap_filter_blocked_buy', 'BUY downgraded to HOLD by institutional VWAP filter', {
+          reason: risk.rejectionReason,
+          price: currentPrice,
+          vwap: snapshot.vwap ?? null,
         });
       }
       if (phase === 'NO_NEW_POSITIONS' && risk.action === 'BUY') {
@@ -554,28 +817,34 @@ export class TradingService {
         });
         return { action: 'HOLD' as const, reason: risk.rejectionReason };
       }
-      const order = await this.submitAndPersistOrder(risk.action, risk.quantity, risk.amountUsdt, sellMinPrice);
-      await this.event('INFO', 'cycle_completed', 'Trading cycle completed with an order', {
-        action: risk.action,
-        orderId: order.orderId,
-      });
-      return { action: risk.action, orderId: order.orderId };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown cycle error';
-      try {
-        await this.event('ERROR', 'unexpected_error', 'Trading cycle failed', { error: message });
-      } catch (eventError) {
-        logger.error({ err: eventError }, 'Could not persist unexpected_error event');
+      const order = await this.submitAndPersistOrder(risk.action, risk.quantity, risk.amountUsdt, sellMinPrice, activeSymbol);
+        if (risk.action === 'BUY') {
+          this.lastBuyExecutionAt.set(activeSymbol, at);
+        } else if (risk.action === 'SELL' && risk.rejectionReason?.startsWith('Automatic partial take profit triggered')) {
+          this.partialTakeProfitPositions.add(activeSymbol);
+        }
+        await this.event('INFO', 'cycle_completed', 'Trading cycle completed with an order', {
+          action: risk.action,
+          symbol: activeSymbol,
+          orderId: order.orderId,
+        });
+        return { action: risk.action, orderId: order.orderId };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown cycle error';
+        try {
+          await this.event('ERROR', 'unexpected_error', 'Trading cycle failed', { error: message });
+        } catch (eventError) {
+          logger.error({ err: eventError }, 'Could not persist unexpected_error event');
+        }
+        logger.error({ err: error, event: 'cycle_error' }, 'Trading cycle failed');
+        throw error;
       }
-      logger.error({ err: error, event: 'cycle_error' }, 'Trading cycle failed');
-      throw error;
     }
-  }
 
-  async forceClosePosition(configuration?: TradingConfiguration) {
-    const effective = configuration ?? await this.operationalConfiguration();
-    return this.exclusive(() => this.forceClosePositionLocked(effective));
-  }
+  async forceClosePosition(configuration ?: TradingConfiguration) {
+      const effective = configuration ?? await this.operationalConfiguration();
+      return this.exclusive(() => this.forceClosePositionLocked(effective));
+    }
 
   private async forceClosePositionLocked(configuration: TradingConfiguration) {
     await this.repo.ensureAccount(configuration.initialBankUsdt);
@@ -599,59 +868,154 @@ export class TradingService {
       return { action: 'HOLD' as const, reason: ready.reason };
     }
     try {
-    const position = await this.repo.openPosition();
-    if (!position) {
-      const onceRepo = this.repo as TradingRepository & {
-        eventOnceForSession?: (level: string, event: string, message: string, at?: Date, payload?: unknown) => Promise<boolean>;
+      const position = await this.repo.openPosition();
+      if (!position) {
+        const onceRepo = this.repo as TradingRepository & {
+          eventOnceForSession?: (level: string, event: string, message: string, at?: Date, payload?: unknown) => Promise<boolean>;
+        };
+        if (onceRepo.eventOnceForSession)
+          await onceRepo.eventOnceForSession('INFO', 'force_close_noop', 'No conceptual position to close', new Date(), { action: 'HOLD' });
+        else await this.event('INFO', 'force_close_noop', 'No conceptual position to close', { action: 'HOLD' });
+        return { action: 'HOLD', reason: 'No open conceptual position' };
+      }
+      const metricsRepo = this.repo as TradingRepository & { recordForceCloseAttempt?: () => Promise<void> };
+      const positionSymbol = (position.symbol ?? config.SYMBOL).toUpperCase();
+      if (typeof this.exchange.setTicker === 'function') {
+        this.exchange.setTicker(positionSymbol);
+      }
+      await this.event('WARN', 'force_close_started', 'Forced close requested for an open conceptual position', { symbol: positionSymbol });
+      const [account, rules, price] = await Promise.all([
+        this.repo.account(),
+        this.exchange.rules(),
+        this.exchange.price(),
+      ]);
+      const pendingRepository = this.repo as TradingRepository & {
+        pendingOrderDetails?: () => Promise<{ side: 'BUY' | 'SELL' } | null>;
       };
-      if (onceRepo.eventOnceForSession)
-        await onceRepo.eventOnceForSession('INFO', 'force_close_noop', 'No conceptual position to close', new Date(), { action: 'HOLD' });
-      else await this.event('INFO', 'force_close_noop', 'No conceptual position to close', { action: 'HOLD' });
-      return { action: 'HOLD', reason: 'No open conceptual position' };
-    }
-    const metricsRepo = this.repo as TradingRepository & { recordForceCloseAttempt?: () => Promise<void> };
-    await metricsRepo.recordForceCloseAttempt?.();
-    await this.event('WARN', 'force_close_started', 'Forced close requested for an open conceptual position', { symbol: config.SYMBOL });
-    const [account, rules, price] = await Promise.all([
-      this.repo.account(),
-      this.exchange.rules(),
-      this.exchange.price(),
-    ]);
-    const pendingRepository = this.repo as TradingRepository & {
-      pendingOrderDetails?: () => Promise<{ side: 'BUY' | 'SELL' } | null>;
-    };
-    const pending = pendingRepository.pendingOrderDetails ? await pendingRepository.pendingOrderDetails() : null;
-    const closeRisk = applyB3Risk({
-      action: 'SELL',
-      requestedBrl: position.quantity * price,
-      price,
-      account: { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt },
-      position: { ticker: config.SYMBOL, quantity: position.quantity, entryPrice: position.entryPrice, costBrl: position.costUsdt },
-      rules,
-      maxPositionPercent: configuration.maxPositionPercent,
-      // A pending SELL is retried with its persisted client id below. A pending
-      // BUY is never retried during the close-only window.
-      duplicateOrderPending: pending ? pending.side !== 'SELL' : await this.repo.pendingOrder(),
-    });
-    const risk = { action: closeRisk.action, amountUsdt: closeRisk.amountBrl, quantity: closeRisk.quantity, rejectionReason: closeRisk.rejectionReason };
-    if (risk.action === 'HOLD') {
-      await this.event('WARN', 'decision_rejected_by_risk', 'Forced close rejected by risk engine', {
-        reason: risk.rejectionReason,
+      const pending = pendingRepository.pendingOrderDetails ? await pendingRepository.pendingOrderDetails() : null;
+      const closeRisk = applyB3Risk({
+        action: 'SELL',
+        requestedBrl: position.quantity * price,
+        price,
+        account: { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt },
+        position: { ticker: positionSymbol, quantity: position.quantity, entryPrice: position.entryPrice, costBrl: position.costUsdt },
+        rules,
+        maxPositionPercent: configuration.maxPositionPercent,
+        // A pending SELL is retried with its persisted client id below. A pending
+        // BUY is never retried during the close-only window.
+        duplicateOrderPending: pending ? pending.side !== 'SELL' : await this.repo.pendingOrder(),
       });
-      return risk;
-    }
-    const order = await this.submitAndPersistOrder('SELL', risk.quantity, risk.amountUsdt);
-    await this.event('WARN', 'force_close_completed', 'Forced close completed', { orderId: order.orderId });
-    // Explicit close-of-day point: the force close happens in a close-only tick
-    // that is followed by no further decision cycle, so this snapshot is what
-    // makes the post-sale cash/zero-position state visible to the dashboard.
-    const closePrice = order.executedQty > 0 ? order.cummulativeQuoteQty / order.executedQty : price;
-    await this.snapshotAfterExecution(closePrice, order.transactTime);
-    return { action: 'SELL', orderId: order.orderId };
+      const risk = { action: closeRisk.action, amountUsdt: closeRisk.amountBrl, quantity: closeRisk.quantity, rejectionReason: closeRisk.rejectionReason };
+      if (risk.action === 'HOLD') {
+        await this.event('WARN', 'decision_rejected_by_risk', 'Forced close rejected by risk engine', {
+          reason: risk.rejectionReason,
+        });
+        return risk;
+      }
+      const order = await this.submitAndPersistOrder('SELL', risk.quantity, risk.amountUsdt, undefined, positionSymbol);
+      await this.event('WARN', 'force_close_completed', 'Forced close completed', { symbol: positionSymbol, orderId: order.orderId });
+      // Explicit close-of-day point: the force close happens in a close-only tick
+      // that is followed by no further decision cycle, so this snapshot is what
+      // makes the post-sale cash/zero-position state visible to the dashboard.
+      const closePrice = order.executedQty > 0 ? order.cummulativeQuoteQty / order.executedQty : price;
+      await this.snapshotAfterExecution(closePrice, order.transactTime);
+      return { action: 'SELL', orderId: order.orderId };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown force-close error';
       await this.event('ERROR', 'force_close_failed', 'Forced close failed and will be retried while the window is open', { error: message });
       throw error;
     }
   }
+
+  /**
+   * Fast-Path de Ingestão em Tempo Real:
+   * Chamado instantaneamente quando um tick de preço chega na fila.
+   * Se houver posição aberta no mesmo ativo, valida imediatamente se o preço violou
+   * os critérios de Stop Loss, Trailing Stop ou Take Profit (SL/TP) e executa a saída a mercado.
+   */
+  async onRealtimeTick(tick: { symbol: string; price: number; timestamp?: number }): Promise<{ executed: boolean; reason?: string }> {
+    if (!tick.symbol || !Number.isFinite(tick.price) || tick.price <= 0) return { executed: false, reason: 'Invalid tick' };
+    const position = await this.repo.openPosition();
+    if (!position) return { executed: false, reason: 'No open position' };
+
+    const activeSymbol = (position.symbol ?? config.SYMBOL).toUpperCase();
+    if (tick.symbol.toUpperCase() !== activeSymbol) return { executed: false, reason: 'Tick symbol differs from active position' };
+
+    const res = await this.exclusive(async () => {
+      // Re-valida posição dentro do lock exclusivo para evitar condições de corrida com o loop periódico
+      const lockedPos = await this.repo.openPosition();
+      if (!lockedPos) return { executed: false, reason: 'No open position under lock' };
+
+      const configuration = await this.operationalConfiguration();
+      const currentPrice = tick.price;
+      const highest = Math.max(this.positionHighWatermark.get(activeSymbol) ?? lockedPos.entryPrice, currentPrice);
+      this.positionHighWatermark.set(activeSymbol, highest);
+
+      const [account, rules, pending] = await Promise.all([
+        this.repo.account(),
+        this.exchange.rules(),
+        this.repo.pendingOrder(),
+      ]);
+
+      const partialDone = this.partialTakeProfitPositions.has(activeSymbol);
+      const trailingStopCapPct = configuration.trailingStopCapPct ?? config.TRAILING_STOP_CAP_PCT;
+
+      const riskCheck = applyB3Risk({
+        action: 'HOLD', // Fast-path avalia se as travas mecânicas obrigam um SELL
+        requestedBrl: 0,
+        price: currentPrice,
+        account: { initialBankBrl: account.initialBankUsdt, cashBrl: account.cashUsdt, realizedPnlBrl: account.realizedPnlUsdt },
+        position: {
+          ticker: activeSymbol,
+          quantity: lockedPos.quantity,
+          entryPrice: lockedPos.entryPrice,
+          costBrl: lockedPos.costUsdt,
+          openedAt: lockedPos.openedAt,
+          highestPrice: highest,
+        },
+        rules,
+        maxPositionPercent: configuration.maxPositionPercent,
+        duplicateOrderPending: pending,
+        stopLossPct: config.STOP_LOSS_PCT,
+        maxStopLossPct: config.MAX_STOP_LOSS_PCT,
+        breakevenTriggerPct: config.BREAKEVEN_TRIGGER_PCT,
+        breakevenProfitLockPct: config.BREAKEVEN_PROFIT_LOCK_PCT,
+        trailingStopPct: config.TRAILING_STOP_PCT,
+        trailingStopCapPct,
+        partialTakeProfitTriggerPct: config.PARTIAL_TAKE_PROFIT_TRIGGER_PCT,
+        partialTakeProfitRatio: config.PARTIAL_TAKE_PROFIT_RATIO,
+        partialTakeProfitDone: partialDone,
+        fullTakeProfitPct: config.FULL_TAKE_PROFIT_PCT,
+        profitTargetMode: config.PROFIT_TARGET_CALCULATION_MODE,
+        dayTradeTaxRate: config.DAY_TRADE_TAX_RATE,
+        timeStopEnabled: config.TIME_STOP_ENABLED,
+        timeStopMinutes: config.TIME_STOP_MINUTES,
+        now: new Date(),
+      });
+
+      if (riskCheck.action === 'SELL' && riskCheck.quantity > 0) {
+        await this.event('WARN', 'realtime_risk_exit_triggered', 'Immediate position exit triggered by realtime tick', {
+          symbol: activeSymbol,
+          tickPrice: currentPrice,
+          reason: riskCheck.rejectionReason,
+          quantity: riskCheck.quantity,
+        });
+
+        const order = await this.submitAndPersistOrder('SELL', riskCheck.quantity, riskCheck.amountBrl, undefined, activeSymbol);
+        if (riskCheck.rejectionReason?.startsWith('Automatic partial take profit triggered')) {
+          this.partialTakeProfitPositions.add(activeSymbol);
+        }
+        await this.snapshotAfterExecution(currentPrice, order.transactTime);
+        return { executed: true, reason: riskCheck.rejectionReason };
+      }
+
+      return { executed: false, reason: 'Price within risk tolerance' };
+    });
+
+    if ('action' in res) {
+      return { executed: false, reason: res.reason };
+    }
+    return { executed: res.executed, reason: res.reason ?? undefined };
+  }
 }
+

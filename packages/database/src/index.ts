@@ -14,6 +14,7 @@ const configurationFromRow = (row: Row): TradingConfiguration => validateTrading
   timezone: String(row.timezone), start: clock(row.start_time), stopNewPositions: clock(row.stop_new_positions_time),
   forceClose: clock(row.force_close_time), end: clock(row.end_time), intervalSeconds: num(row.interval_seconds),
   initialBankUsdt: num(row.initial_bank_usdt), maxPositionPercent: num(row.max_position_percent),
+  trailingStopCapPct: row.trailing_stop_cap_pct != null ? num(row.trailing_stop_cap_pct) : undefined,
   updatedAt: row.updated_at ? new Date(String(row.updated_at)) : null,
 });
 /** Never pass JS arrays/objects directly to pg for a jsonb parameter. */
@@ -100,7 +101,7 @@ export const configurationEditabilityFromState = (
   };
 };
 export class TradingRepository {
-  constructor(private client: pg.Pool = pool) {}
+  constructor(private client: pg.Pool = pool) { }
   async health() {
     await this.client.query('select 1');
     return true;
@@ -232,6 +233,7 @@ export class TradingRepository {
       timezone: String(session.timezone), start: clock(session.start_time), stopNewPositions: clock(session.stop_new_positions_time),
       forceClose: clock(session.force_close_time), end: clock(session.end_time), intervalSeconds: num(session.interval_seconds),
       initialBankUsdt: fallback.initialBankUsdt, maxPositionPercent: fallback.maxPositionPercent,
+      trailingStopCapPct: fallback.trailingStopCapPct,
     });
   }
   async ensureAccount(initial: number): Promise<Account> {
@@ -264,6 +266,7 @@ export class TradingRepository {
       entryPrice: num(r.entry_price),
       costUsdt: num(r.cost_usdt),
       openedAt: new Date(String(r.opened_at)),
+      symbol: r.symbol ? String(r.symbol) : undefined,
     };
   }
   async pendingOrder(): Promise<boolean> {
@@ -444,7 +447,7 @@ export class TradingRepository {
       `insert into account_snapshots(cash_usdt,equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,net_pnl_usdt,price,position_quantity,position_cost_usdt,created_at)
        values($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
       [performance.cashUsdt, performance.equityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt,
-        performance.netPnlUsdt, price, position?.quantity ?? null, position?.costUsdt ?? null, at],
+      performance.netPnlUsdt, price, position?.quantity ?? null, position?.costUsdt ?? null, at],
     );
   }
   async saveDecision(
@@ -509,7 +512,9 @@ export class TradingRepository {
     commission: number;
     fills?: ExecutionFill[];
     at: Date;
-  }): Promise<{ applied: boolean }> {
+    symbol?: string;
+  },
+  ): Promise<{ applied: boolean }> {
     const c = await this.client.connect();
     try {
       await c.query('begin');
@@ -560,9 +565,10 @@ export class TradingRepository {
           await c.query('update positions set quantity=$1,entry_price=$2,cost_usdt=$3 where id=$4', [quantity, cost / quantity, cost, open.rows[0].id]);
           positionId = Number(open.rows[0].id);
         } else {
+          const tradeSymbol = (order.symbol ?? config.SYMBOL).toUpperCase();
           const p = await c.query<{ id: number }>(
             'insert into positions(symbol,quantity,entry_price,cost_usdt,status,opened_at) values($1,$2,$3,$4,$5,$6) returning id',
-            [config.SYMBOL, accounting.positionQuantity, accounting.effectiveQuoteAmount / accounting.positionQuantity, accounting.effectiveQuoteAmount, 'OPEN', order.at],
+            [tradeSymbol, accounting.positionQuantity, accounting.effectiveQuoteAmount / accounting.positionQuantity, accounting.effectiveQuoteAmount, 'OPEN', order.at],
           );
           positionId = p.rows[0].id;
         }
@@ -589,11 +595,41 @@ export class TradingRepository {
         const grossPnl = order.quote - costOfSold;
         const pnl = accounting.effectiveQuoteAmount - costOfSold;
         if (fullClose) {
-          await c.query("update positions set status='CLOSED',closed_at=$1,realized_pnl_usdt=coalesce(realized_pnl_usdt,0)+$2 where id=$3", [order.at, pnl, p.id]);
-        } else {
+          const openedAtDate = new Date(String(p.opened_at));
+          const closedAtDate = new Date(order.at);
+          const durationSeconds = Math.max(0, Math.floor((closedAtDate.getTime() - openedAtDate.getTime()) / 1000));
+          const entryPrice = num(p.entry_price);
+          const snapRes = await c.query<Row>(
+            'select max(price) as max_price, min(price) as min_price from account_snapshots where created_at >= $1 and created_at <= $2',
+            [openedAtDate, closedAtDate],
+          );
+          const snapMax = snapRes.rows[0]?.max_price != null ? num(snapRes.rows[0].max_price) : entryPrice;
+          const snapMin = snapRes.rows[0]?.min_price != null ? num(snapRes.rows[0].min_price) : entryPrice;
+          const highestPrice = Math.max(entryPrice, snapMax, order.quote / order.quantity);
+          const lowestPrice = Math.min(entryPrice, snapMin, order.quote / order.quantity);
+          const mfePct = entryPrice > 0 ? Number((((highestPrice - entryPrice) / entryPrice) * 100).toFixed(4)) : 0;
+          const maePct = entryPrice > 0 ? Number((((lowestPrice - entryPrice) / entryPrice) * 100).toFixed(4)) : 0;
+          const exitEventRes = await c.query<Row>(
+            `select coalesce(
+              (select payload->>'reason' from system_events where created_at >= $1::timestamptz - interval '5 seconds' and created_at <= $1::timestamptz + interval '5 seconds' and event in ('decision_rejected_by_risk', 'realtime_risk_exit_triggered') order by id desc limit 1),
+              (select 'Forced close at end of session' from system_events where created_at >= $1::timestamptz - interval '5 seconds' and created_at <= $1::timestamptz + interval '5 seconds' and event = 'force_close_completed' order by id desc limit 1),
+              (select 'AI discretionary SELL decision' from system_events where created_at >= $1::timestamptz - interval '5 seconds' and created_at <= $1::timestamptz + interval '5 seconds' and event = 'decision_created' and payload->>'requestedAction' = 'SELL' order by id desc limit 1),
+              'Market exit'
+            ) as reason`,
+            [closedAtDate],
+          );
+          const exitReason = String(exitEventRes.rows[0]?.reason ?? 'Market exit');
           await c.query(
-            'update positions set quantity=quantity-$1,cost_usdt=cost_usdt-$2,realized_pnl_usdt=coalesce(realized_pnl_usdt,0)+$3 where id=$4',
-            [accounting.positionQuantity, costOfSold, pnl, p.id],
+            "update positions set status='CLOSED',closed_at=$1,realized_pnl_usdt=coalesce(realized_pnl_usdt,0)+$2,duration_seconds=$3,highest_price=$4,lowest_price=$5,mfe_pct=$6,mae_pct=$7,exit_reason=$8 where id=$9",
+            [order.at, pnl, durationSeconds, highestPrice, lowestPrice, mfePct, maePct, exitReason, p.id],
+          );
+        } else {
+          const remainingQty = positionQuantity - accounting.positionQuantity;
+          const remainingCost = cost - costOfSold;
+          const entryPrice = remainingQty > 0 ? num(p.entry_price) : 0;
+          await c.query(
+            'update positions set quantity=$1,cost_usdt=$2,entry_price=$3,realized_pnl_usdt=coalesce(realized_pnl_usdt,0)+$4 where id=$5',
+            [remainingQty, remainingCost, entryPrice, pnl, p.id],
           );
         }
         const trade = await c.query<{ id: number }>(
@@ -638,8 +674,8 @@ export class TradingRepository {
   }
   async trades() {
     return (await this.client.query(
-      `select t.*, coalesce(f.fees,'[]'::jsonb) as fees, coalesce(f.fees_by_asset,'{}'::jsonb) as fees_by_asset
-       from trades t left join lateral (
+      `select t.*, p.symbol, coalesce(f.fees,'[]'::jsonb) as fees, coalesce(f.fees_by_asset,'{}'::jsonb) as fees_by_asset
+       from trades t left join positions p on p.id=t.position_id left join lateral (
          select jsonb_agg(jsonb_build_object('asset',asset,'amount',amount,'amountUsdt',amount_usdt) order by id) as fees,
                 jsonb_object_agg(asset,amount) as fees_by_asset
          from trade_fees where trade_id=t.id
@@ -652,6 +688,14 @@ export class TradingRepository {
   async events() {
     return (await this.client.query('select * from system_events order by id desc limit 100')).rows;
   }
+  async errorCountForDay(day = sessionDay(), timezone = defaultTradingConfiguration.timezone): Promise<number> {
+    const res = await this.client.query<{ count: string | number }>(
+      `select count(*)::int as count from system_events
+       where to_char(created_at at time zone $2, 'YYYY-MM-DD') = $1 and level = 'ERROR'`,
+      [day, timezone],
+    );
+    return Number(res.rows[0]?.count ?? 0);
+  }
   async lastHeartbeat() {
     return (
       (await this.client.query('select * from worker_heartbeats order by created_at desc limit 1')).rows[0] ??
@@ -663,6 +707,20 @@ export class TradingRepository {
   }
   async dailyResult(day = sessionDay()) {
     return (await this.client.query('select * from daily_results where session_day=$1', [day])).rows[0] ?? null;
+  }
+  /** Retorna o PnL líquido realizado acumulado para a sessão do dia especificado. */
+  async dailyRealizedPnl(day = sessionDay(), timezone = defaultTradingConfiguration.timezone): Promise<number> {
+    const daily = await this.dailyResult(day);
+    if (daily && daily.realized_pnl_usdt !== null && daily.realized_pnl_usdt !== undefined) {
+      return num(daily.realized_pnl_usdt);
+    }
+    const res = await this.client.query<Row>(
+      `select coalesce(sum(net_pnl_usdt) filter (where side='SELL'), 0) as daily_pnl
+       from trades
+       where to_char(executed_at at time zone $2, 'YYYY-MM-DD') = $1`,
+      [day, timezone],
+    );
+    return num(res.rows[0]?.daily_pnl ?? 0);
   }
   async dailyResultStatus(day = sessionDay()): Promise<'PENDING' | 'OK' | 'ERROR' | null> {
     if (await this.dailyResult(day)) return 'OK';
@@ -719,10 +777,12 @@ export class TradingRepository {
        count(*)::int as trade_count,
        (select count(*)::int from ai_decisions d where d.timestamp >= $1 and d.timestamp <= $2 and d.action_after_risk='HOLD') as hold_count,
        (select count(*)::int from ai_decisions d where d.timestamp >= $1 and d.timestamp <= $2 and d.action_requested <> d.action_after_risk) as rejected_count,
-       (select count(*)::int from ai_usage u join ai_decisions d on d.id=u.decision_id where d.timestamp >= $1 and d.timestamp <= $2) as ai_calls,
+       (select count(*)::int from ai_decisions d where d.timestamp >= $1 and d.timestamp <= $2 and coalesce(d.model_returned,'') <> 'deterministic_robots') as ai_calls,
+       (select count(*)::int from ai_decisions d where d.timestamp >= $1 and d.timestamp <= $2 and coalesce(d.model_returned,'') = 'deterministic_robots') as bypass_count,
        (select coalesce(sum(u.cost_usd),0) from ai_usage u join ai_decisions d on d.id=u.decision_id where d.timestamp >= $1 and d.timestamp <= $2) as ai_cost,
        (select coalesce(jsonb_agg(distinct u.model) filter (where u.model is not null),'[]'::jsonb) from ai_usage u join ai_decisions d on d.id=u.decision_id where d.timestamp >= $1 and d.timestamp <= $2) as models,
        (select count(*)::int from system_events e where e.created_at >= $1 and e.created_at <= $2 and e.event='ai_fallback') as fallback_count,
+       (select count(*)::int from system_events e where e.created_at >= $1 and e.created_at <= $2 and (e.event='ai_rate_limit_429' or (e.event='ai_error' and e.message like '%429%'))) as rate_limit_429_count,
        (select count(*)::int from system_events e where e.created_at >= $1 and e.created_at <= $2 and e.level='ERROR') as error_count,
        (select exists(select 1 from system_events e where e.created_at >= $1 and e.created_at <= $2 and e.event='force_close_completed' and e.payload ? 'orderId')) as forced_close,
        coalesce(sum(t.gross_pnl_usdt) filter (where t.side='SELL'),0) as gross_pnl,
@@ -731,17 +791,78 @@ export class TradingRepository {
       [startedAt, finishedAt],
     );
     const metrics = rows[0];
+
+    const posStatsRes = await this.client.query<Row>(
+      `select
+       count(*)::int as position_count,
+       count(*) filter (where realized_pnl_usdt > 0)::int as win_count,
+       count(*) filter (where realized_pnl_usdt < 0)::int as loss_count,
+       coalesce(avg(realized_pnl_usdt) filter (where realized_pnl_usdt > 0), 0) as avg_win,
+       coalesce(avg(abs(realized_pnl_usdt)) filter (where realized_pnl_usdt < 0), 0) as avg_loss,
+       coalesce(sum(realized_pnl_usdt) filter (where realized_pnl_usdt > 0), 0) as gross_win,
+       coalesce(sum(abs(realized_pnl_usdt)) filter (where realized_pnl_usdt < 0), 0) as gross_loss
+       from positions
+       where opened_at >= $1 and opened_at <= $2 and status='CLOSED'`,
+      [startedAt, finishedAt],
+    );
+    const posStats = posStatsRes.rows[0];
+    const positionCount = num(posStats?.position_count ?? 0);
+    const winCount = num(posStats?.win_count ?? 0);
+    const lossCount = num(posStats?.loss_count ?? 0);
+    const avgWinUsdt = num(posStats?.avg_win ?? 0);
+    const avgLossUsdt = num(posStats?.avg_loss ?? 0);
+    const grossWin = num(posStats?.gross_win ?? 0);
+    const grossLoss = num(posStats?.gross_loss ?? 0);
+    const profitFactor = grossLoss > 0 ? Number((grossWin / grossLoss).toFixed(4)) : (grossWin > 0 ? 999 : null);
+    const winRate = positionCount > 0 ? winCount / positionCount : 0;
+    const lossRate = positionCount > 0 ? lossCount / positionCount : 0;
+    const expectancyUsdt = Number((winRate * avgWinUsdt - lossRate * avgLossUsdt).toFixed(4));
+    const grossPnl = num(metrics.gross_pnl);
+    const netPnl = num(metrics.net_pnl);
+    const grossReturnPct = initialEquityUsdt > 0 ? (grossPnl / initialEquityUsdt) * 100 : 0;
+    const netReturnPct = initialEquityUsdt > 0 ? ((performance.equityUsdt - initialEquityUsdt) / initialEquityUsdt) * 100 : 0;
+    const feesPctOfGross = Math.abs(grossPnl) > 0 ? (dailyFees.feesUsdtKnown / Math.abs(grossPnl)) * 100 : null;
+
     await this.client.query(
-      `insert into daily_results(day,session_day,timezone,equity_usdt,initial_equity_usdt,final_equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,fees_by_asset,gross_return_pct,trade_count,buy_count,sell_count,hold_count,rejected_decision_count,ai_call_count,ai_cost_usd,models_used,fallback_count,error_count,forced_close_occurred,started_at,finished_at)
-       values($1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25)
-       on conflict(session_day) where session_day is not null do update set final_equity_usdt=excluded.final_equity_usdt,equity_usdt=excluded.equity_usdt,realized_pnl_usdt=excluded.realized_pnl_usdt,unrealized_pnl_usdt=excluded.unrealized_pnl_usdt,gross_pnl_usdt=excluded.gross_pnl_usdt,fees_usdt_known=excluded.fees_usdt_known,net_pnl_usdt=excluded.net_pnl_usdt,fees_by_asset=excluded.fees_by_asset,gross_return_pct=excluded.gross_return_pct,trade_count=excluded.trade_count,buy_count=excluded.buy_count,sell_count=excluded.sell_count,hold_count=excluded.hold_count,rejected_decision_count=excluded.rejected_decision_count,ai_call_count=excluded.ai_call_count,ai_cost_usd=excluded.ai_cost_usd,models_used=excluded.models_used,fallback_count=excluded.fallback_count,error_count=excluded.error_count,forced_close_occurred=excluded.forced_close_occurred,finished_at=excluded.finished_at`,
-      [at, day, schedule.timezone, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt, num(metrics.gross_pnl), dailyFees.feesUsdtKnown, num(metrics.net_pnl), serializeJsonb(dailyFees.feesByAsset), ((performance.equityUsdt-initialEquityUsdt)/initialEquityUsdt)*100, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count, metrics.ai_calls, metrics.ai_cost, serializeJsonb(metrics.models ?? []), metrics.fallback_count, metrics.error_count, metrics.forced_close, startedAt, finishedAt],
+      `insert into daily_results(
+        day,session_day,timezone,equity_usdt,initial_equity_usdt,final_equity_usdt,
+        realized_pnl_usdt,unrealized_pnl_usdt,gross_pnl_usdt,fees_usdt_known,net_pnl_usdt,fees_by_asset,
+        gross_return_pct,net_return_pct,trade_count,buy_count,sell_count,hold_count,rejected_decision_count,
+        ai_call_count,bypass_count,ai_cost_usd,models_used,fallback_count,rate_limit_429_count,error_count,forced_close_occurred,
+        started_at,finished_at,position_count,win_count,loss_count,avg_win_usdt,avg_loss_usdt,profit_factor,expectancy_usdt,fees_pct_of_gross
+      ) values(
+        $1,$2,$3,$4,$5,$4,$6,$7,$8,$9,$10,$11::jsonb,
+        $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb,$23,$24,$25,$26,
+        $27,$28,$29,$30,$31,$32,$33,$34,$35,$36
+      )
+      on conflict(session_day) where session_day is not null do update set
+        final_equity_usdt=excluded.final_equity_usdt,equity_usdt=excluded.equity_usdt,
+        realized_pnl_usdt=excluded.realized_pnl_usdt,unrealized_pnl_usdt=excluded.unrealized_pnl_usdt,
+        gross_pnl_usdt=excluded.gross_pnl_usdt,fees_usdt_known=excluded.fees_usdt_known,net_pnl_usdt=excluded.net_pnl_usdt,
+        fees_by_asset=excluded.fees_by_asset,gross_return_pct=excluded.gross_return_pct,net_return_pct=excluded.net_return_pct,
+        trade_count=excluded.trade_count,buy_count=excluded.buy_count,sell_count=excluded.sell_count,
+        hold_count=excluded.hold_count,rejected_decision_count=excluded.rejected_decision_count,
+        ai_call_count=excluded.ai_call_count,bypass_count=excluded.bypass_count,ai_cost_usd=excluded.ai_cost_usd,
+        models_used=excluded.models_used,fallback_count=excluded.fallback_count,rate_limit_429_count=excluded.rate_limit_429_count,
+        error_count=excluded.error_count,
+        forced_close_occurred=excluded.forced_close_occurred,finished_at=excluded.finished_at,
+        position_count=excluded.position_count,win_count=excluded.win_count,loss_count=excluded.loss_count,
+        avg_win_usdt=excluded.avg_win_usdt,avg_loss_usdt=excluded.avg_loss_usdt,profit_factor=excluded.profit_factor,
+        expectancy_usdt=excluded.expectancy_usdt,fees_pct_of_gross=excluded.fees_pct_of_gross`,
+      [
+        at, day, schedule.timezone, performance.equityUsdt, initialEquityUsdt, performance.realizedPnlUsdt, performance.unrealizedPnlUsdt,
+        grossPnl, dailyFees.feesUsdtKnown, netPnl, serializeJsonb(dailyFees.feesByAsset),
+        grossReturnPct, netReturnPct, metrics.trade_count, metrics.buy_count, metrics.sell_count, metrics.hold_count, metrics.rejected_count,
+        metrics.ai_calls, metrics.bypass_count, metrics.ai_cost, serializeJsonb(metrics.models ?? []), metrics.fallback_count, metrics.rate_limit_429_count, metrics.error_count,
+        metrics.forced_close, startedAt, finishedAt,
+        positionCount, winCount, lossCount, avgWinUsdt, avgLossUsdt, profitFactor, expectancyUsdt, feesPctOfGross,
+      ],
     );
     // Older sessions predate the explicit counter; the persisted decision
     // evidence is authoritative when recovering their daily result.
     await this.client.query(
       'update trading_sessions set decision_cycles=greatest(decision_cycles,$2),updated_at=$3 where session_day=$1',
-      [day, num(metrics.ai_calls), at],
+      [day, num(metrics.ai_calls) + num(metrics.bypass_count), at],
     );
     await this.markDailyResultOk(at);
     return this.dailyResult(day);
@@ -943,8 +1064,8 @@ export class TradingRepository {
         `select cash_usdt,equity_usdt,realized_pnl_usdt,unrealized_pnl_usdt,net_pnl_usdt,price,position_quantity,position_cost_usdt,created_at
          from account_snapshots where to_char(created_at at time zone $2,'YYYY-MM-DD')=$1 order by created_at`, localDay),
       this.client.query<Row>(
-        `select t.side,t.quantity,t.quote_amount,t.net_quantity,t.net_quote_amount,t.gross_pnl_usdt,t.fees_usdt_known,t.net_pnl_usdt,t.executed_at,o.broker_order_id
-         from trades t join orders o on o.id=t.order_id
+        `select t.side,t.quantity,t.quote_amount,t.net_quantity,t.net_quote_amount,t.gross_pnl_usdt,t.fees_usdt_known,t.net_pnl_usdt,t.executed_at,o.broker_order_id,p.symbol
+         from trades t join orders o on o.id=t.order_id left join positions p on p.id=t.position_id
          where to_char(t.executed_at at time zone $2,'YYYY-MM-DD')=$1 order by t.executed_at desc`, localDay),
       this.client.query<Row>(
         `select timestamp,model_returned,model_requested,action_requested,action_after_risk,amount_requested,amount_after_risk,confidence,reason,rejection_reason
@@ -970,7 +1091,7 @@ export class TradingRepository {
       // Transactional truth for the current day: the panel must never show a
       // phantom position after a sale/force close that happened after the last
       // account snapshot (BUG-10 parte C).
-      this.client.query<Row>("select quantity,entry_price,cost_usdt from positions where status='OPEN' order by id desc limit 1"),
+      this.client.query<Row>("select symbol,quantity,entry_price,cost_usdt from positions where status='OPEN' order by id desc limit 1"),
     ]);
     const account = accountResult.rows[0];
     const session = sessionResult.rows[0] ?? null;
@@ -1069,9 +1190,9 @@ export class TradingRepository {
       },
       performance: { realizedPnlUsdt, unrealizedPnlUsdt, netPnlUsdt, returnPct: initialBankUsdt && finalEquity !== null ? ((finalEquity - initialBankUsdt) / initialBankUsdt) * 100 : null },
       position: positionOpen
-        ? { symbol: config.SYMBOL, quantity: positionQuantity, costUsdt: positionCostUsdt, price: positionPrice }
+        ? { symbol: (livePosition?.symbol ? String(livePosition.symbol) : config.SYMBOL).toUpperCase(), quantity: positionQuantity, costUsdt: positionCostUsdt, price: positionPrice }
         : null,
-      decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), brokerOrderId: row.broker_order_id })),
+      decisions, decisionCounts, trades: tradesResult.rows.map((row) => ({ at: new Date(String(row.executed_at)).toISOString(), symbol: row.symbol ? String(row.symbol).toUpperCase() : config.SYMBOL, side: row.side, quantity: num(row.quantity), quoteAmount: num(row.quote_amount), netQuantity: row.net_quantity === null ? null : num(row.net_quantity), netQuoteAmount: row.net_quote_amount === null ? null : num(row.net_quote_amount), grossPnlUsdt: row.gross_pnl_usdt === null ? null : num(row.gross_pnl_usdt), feesUsdtKnown: num(row.fees_usdt_known), netPnlUsdt: row.net_pnl_usdt === null ? null : num(row.net_pnl_usdt), brokerOrderId: row.broker_order_id })),
       aiUsage: { models, fallbacks: fallbackCount, totalTokens: models.reduce((total, model) => total + model.totalTokens, 0), totalCostUsd: models.reduce((total, model) => total + model.costUsd, 0) },
       events: eventsResult.rows.map((row) => ({ level: row.level, event: row.event, message: row.message, at: new Date(String(row.created_at)).toISOString() })),
       equityHistory: snapshots.map(({ at, cashUsdt, equityUsdt }) => ({ at, cashUsdt, equityUsdt })),
@@ -1080,7 +1201,32 @@ export class TradingRepository {
         const totalPnl = initialBankUsdt !== null ? equityUsdt - initialBankUsdt : t;
         return { at, realizedPnlUsdt: totalPnl, totalPnlUsdt: totalPnl };
       }),
-      summary: daily && { final: daily.final_equity_usdt !== null && daily.final_equity_usdt !== undefined, tradeCount: num(daily.trade_count), buyCount: num(daily.buy_count), sellCount: num(daily.sell_count), holdCount: num(daily.hold_count), rejectedDecisionCount: num(daily.rejected_decision_count), feesUsdtKnown: num(daily.fees_usdt_known), fallbackCount: num(daily.fallback_count), errorCount: num(daily.error_count), forceCloseOccurred: Boolean(daily.forced_close_occurred), openPosition: false },
+      summary: daily && {
+        final: daily.final_equity_usdt !== null && daily.final_equity_usdt !== undefined,
+        tradeCount: num(daily.trade_count),
+        buyCount: num(daily.buy_count),
+        sellCount: num(daily.sell_count),
+        holdCount: num(daily.hold_count),
+        rejectedDecisionCount: num(daily.rejected_decision_count),
+        feesUsdtKnown: num(daily.fees_usdt_known),
+        fallbackCount: num(daily.fallback_count),
+        errorCount: num(daily.error_count),
+        forceCloseOccurred: Boolean(daily.forced_close_occurred),
+        openPosition: false,
+        grossReturnPct: daily.gross_return_pct != null ? num(daily.gross_return_pct) : null,
+        netReturnPct: daily.net_return_pct != null ? num(daily.net_return_pct) : null,
+        aiCallCount: num(daily.ai_call_count),
+        bypassCount: num(daily.bypass_count),
+        positionCount: num(daily.position_count),
+        winCount: num(daily.win_count),
+        lossCount: num(daily.loss_count),
+        winRatePct: num(daily.position_count) > 0 ? (num(daily.win_count) / num(daily.position_count)) * 100 : 0,
+        avgWinUsdt: num(daily.avg_win_usdt),
+        avgLossUsdt: num(daily.avg_loss_usdt),
+        profitFactor: daily.profit_factor != null ? num(daily.profit_factor) : null,
+        expectancyUsdt: num(daily.expectancy_usdt),
+        feesPctOfGross: daily.fees_pct_of_gross != null ? num(daily.fees_pct_of_gross) : null,
+      },
       eventCounts: { errors: errorCount },
     };
   }

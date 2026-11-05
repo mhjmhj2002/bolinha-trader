@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-Apresentar a Operação Bolinha de Gude sem exigir leitura do código. Para preparar o ambiente, siga o [setup](04_SETUP_LOCAL.md); para a rotina diária, use o [runbook](20_RUNBOOK_OPERACIONAL.md).
+Apresentar a Bolinha Trader sem exigir leitura do código. Para preparar o ambiente, siga o [setup](04_SETUP_LOCAL.md); para a rotina diária, use o [runbook](20_RUNBOOK_OPERACIONAL.md).
 
 O projeto testa um fluxo autônomo de trading de `PETR4` em Spot Testnet. A banca é **conceitual**: o PostgreSQL registra caixa, posição, P/L e custos de IA próprios da experiência. Ela não é o saldo total da conta B3.
 

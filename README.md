@@ -1,6 +1,6 @@
 # Bolinha Trader
 
-**Operação Bolinha de Gude** é um experimento de trading autônomo para `PETR4`: dados de mercado B3, sinais de IA via OpenRouter, risco determinístico, execução na B3 em modo paper (simulado) e ledger conceitual em PostgreSQL.
+**Bolinha Trader** é um experimento de trading autônomo para `PETR4`: dados de mercado B3, sinais de IA via OpenRouter, risco determinístico, execução na B3 em modo paper (simulado) e ledger conceitual em PostgreSQL.
 
 > Nesta fase o projeto opera **somente B3 em modo paper (simulado)**. Não há dinheiro real.
 

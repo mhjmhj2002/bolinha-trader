@@ -8,7 +8,7 @@ describe('dashboard endpoints', () => {
     const page = await dashboardApp.inject({ method: 'GET', url: '/dashboard' });
     expect(page.statusCode).toBe(200);
     expect(page.headers['content-type']).toContain('text/html');
-    expect(page.body).toContain('Operação Bolinha de Gude');
+    expect(page.body).toContain('Bolinha Trader');
 
     const data = await dashboardApp.inject({ method: 'GET', url: '/dashboard/data?date=not-a-date' });
     expect(data.statusCode).toBe(400);

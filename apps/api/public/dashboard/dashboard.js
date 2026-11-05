@@ -120,8 +120,9 @@
   function renderTables(payload) {
     $('trades-table').innerHTML = payload.trades.length ? payload.trades.map((trade) => {
       const pnl = tradePnl(trade);
-      return `<tr><td>${time(trade.at)}</td><td>${badge(trade.side)}</td><td>${number(trade.netQuantity ?? trade.quantity, 0)}</td><td>${trade.quantity ? money(trade.quoteAmount / trade.quantity) : '—'}</td><td>${money(trade.quoteAmount)}</td><td>${money(trade.feesUsdtKnown)}</td><td class="${pnl.tone}"${pnl.title ? ` title="${escape(pnl.title)}"` : ''}>${pnl.text}</td><td class="font-monospace small">${escape(trade.brokerOrderId)}</td></tr>`;
-    }).join('') : empty(8, 'Nenhum trade no dia.');
+      const symbolBadge = `<span class="badge text-bg-light border text-dark font-monospace">${escape(trade.symbol || '—')}</span>`;
+      return `<tr><td>${time(trade.at)}</td><td>${symbolBadge}</td><td>${badge(trade.side)}</td><td>${number(trade.netQuantity ?? trade.quantity, 0)}</td><td>${trade.quantity ? money(trade.quoteAmount / trade.quantity) : '—'}</td><td>${money(trade.quoteAmount)}</td><td>${money(trade.feesUsdtKnown)}</td><td class="${pnl.tone}"${pnl.title ? ` title="${escape(pnl.title)}"` : ''}>${pnl.text}</td><td class="font-monospace small">${escape(trade.brokerOrderId)}</td></tr>`;
+    }).join('') : empty(9, 'Nenhum trade no dia.');
     $('decisions-table').innerHTML = payload.decisions.length ? payload.decisions.map((decision) => `<tr class="${decision.actionRequested !== decision.actionAfterRisk ? 'table-warning' : ''}"><td>${time(decision.at)}</td><td class="small">${escape(decision.model)}</td><td>${badge(decision.actionRequested)}</td><td>${badge(decision.actionAfterRisk)}</td><td>${money(decision.amountAfterRisk)}</td><td>${number(decision.confidence * 100, 0)}%</td><td class="reason">${escape(decision.reason)}</td><td class="reason">${escape(decision.rejectionReason)}</td></tr>`).join('') : empty(8, 'Nenhuma decisão no dia.');
     renderEvents();
   }
@@ -136,7 +137,18 @@
     const phases = { START: 'TRADING', 'STOP BUY': 'NO_NEW_POSITIONS', 'FORCE CLOSE': 'FORCE_CLOSE', END: 'FINISHED' };
     $('session-timeline').innerHTML = schedule.map(([name, defaultAt]) => `<li class="${payload.session?.phase === phases[name] ? 'active' : ''}"><strong>${defaultAt}</strong><span class="ms-2">${name}</span></li>`).join('');
     const summary = payload.summary;
-    $('final-summary').innerHTML = summary?.final ? `<strong>RESULTADO FINAL</strong><dl class="row mb-0 mt-2"><dt class="col-7">Resultado líquido</dt><dd class="col-5 text-end">${signedMoney(payload.performance.netPnlUsdt)}</dd><dt class="col-7">Taxas conhecidas</dt><dd class="col-5 text-end">${money(summary.feesUsdtKnown)}</dd><dt class="col-7">Force close</dt><dd class="col-5 text-end">${summary.forceCloseOccurred ? 'Sim' : 'Não'}</dd><dt class="col-7">Resultado operacional</dt><dd class="col-5 text-end">${summary.errorCount ? 'ERRO' : 'OK'}</dd></dl>` : '<span class="text-secondary">Sessão em andamento ou ainda sem resultado consolidado.</span>';
+    $('final-summary').innerHTML = summary?.final ? `<strong>RESULTADO FINAL</strong><dl class="row mb-0 mt-2">
+      <dt class="col-7">Retorno líquido / bruto</dt><dd class="col-5 text-end">${signedPercent(summary.netReturnPct ?? payload.performance.returnPct)} / ${signedPercent(summary.grossReturnPct)}</dd>
+      <dt class="col-7">Resultado líquido</dt><dd class="col-5 text-end">${signedMoney(payload.performance.netPnlUsdt)}</dd>
+      <dt class="col-7">Taxas conhecidas</dt><dd class="col-5 text-end">${money(summary.feesUsdtKnown)}${summary.feesPctOfGross != null ? ` (${number(summary.feesPctOfGross, 1)}% do bruto)` : ''}</dd>
+      <dt class="col-7">Posições (Win / Loss)</dt><dd class="col-5 text-end">${summary.positionCount ?? 0} (${summary.winCount ?? 0}W / ${summary.lossCount ?? 0}L · ${number(summary.winRatePct, 1)}%)</dd>
+      <dt class="col-7">Ganho Médio / Perda Média</dt><dd class="col-5 text-end">${money(summary.avgWinUsdt)} / ${money(summary.avgLossUsdt)}</dd>
+      <dt class="col-7">Profit Factor</dt><dd class="col-5 text-end">${summary.profitFactor != null ? number(summary.profitFactor, 2) : '—'}</dd>
+      <dt class="col-7">Expectativa Matemática</dt><dd class="col-5 text-end">${signedMoney(summary.expectancyUsdt)}</dd>
+      <dt class="col-7">Decisões IA / Determinísticas</dt><dd class="col-5 text-end">${summary.aiCallCount ?? 0} / ${summary.bypassCount ?? 0}</dd>
+      <dt class="col-7">Force close</dt><dd class="col-5 text-end">${summary.forceCloseOccurred ? 'Sim' : 'Não'}</dd>
+      <dt class="col-7">Resultado operacional</dt><dd class="col-5 text-end">${summary.errorCount ? 'ERRO' : 'OK'}</dd>
+    </dl>` : '<span class="text-secondary">Sessão em andamento ou ainda sem resultado consolidado.</span>';
   }
   function render(payload) {
     data = payload;

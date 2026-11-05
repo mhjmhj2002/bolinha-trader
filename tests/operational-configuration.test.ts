@@ -24,7 +24,7 @@ describe('persisted operational configuration fixtures', () => {
   });
 
   it('rejects invalid operational configurations before they can start trading', () => {
-    expect(() => validateTradingConfiguration({ ...defaultTradingConfiguration, forceClose: '17:49' })).toThrow(/strictly ordered/);
+    expect(() => validateTradingConfiguration({ ...defaultTradingConfiguration, forceClose: '16:44' })).toThrow(/strictly ordered/);
     expect(() => validateTradingConfiguration({ ...defaultTradingConfiguration, intervalSeconds: 0 })).toThrow(/intervalSeconds/);
     expect(() => validateTradingConfiguration({ ...defaultTradingConfiguration, timezone: 'not/a-timezone' })).toThrow(/timezone/);
   });

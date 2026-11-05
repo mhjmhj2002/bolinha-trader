@@ -60,10 +60,16 @@ pause_on_finish() {
 
 trap pause_on_finish EXIT
 
-log_info "Interrompendo todos os serviços Docker Compose (down)..."
-docker compose down
+# Preserva a saída real de runtime ANTES de destruir os contêineres:
+# <logs>/<timestamp>-<serviço>-runtime-log.txt (snapshot, sem `-f`, não bloqueia).
+# Usa janela expandida de 24 horas para capturar toda a sessão em execução, não apenas o instante do stop.
+log_info "Capturando logs de runtime antes de encerrar os contêineres (últimas 24h)..."
+capture_runtime_logs --since "24 hours ago" postgres api worker
 
-log_info "Verificando se restou algum contêiner ativo..."
+log_info "Parando todos os serviços Docker Compose (stop)..."
+docker compose stop
+
+log_info "Status dos contêineres..."
 docker compose ps
 
 log_success "Projeto bolinha-trader totalmente encerrado."
